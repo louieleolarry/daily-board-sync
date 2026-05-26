@@ -1,0 +1,48 @@
+{
+  "confluence": {
+    "base_url": "__ATLASSIAN_URL__",
+    "space_key": "__SPACE_KEY__",
+    "page_title_prefix": "Week of",
+    "week_start_day": "monday",
+    "sections": ["__SECTION_1__", "__SECTION_2__"]
+  },
+  "board": {
+    "api_base": "https://workflowshortcuts.com/api",
+    "board_id": "__BOARD_ID__",
+    "permanent_columns": ["todo", "in-progress", "done"],
+    "all_columns": {
+      "todo":        {"title": "Todo",        "order": 1},
+      "in-progress": {"title": "In Progress", "order": 2},
+      "in-review":   {"title": "In Review",   "order": 3},
+      "blocked":     {"title": "Blocked",     "order": 4},
+      "on-hold":     {"title": "On Hold",     "order": 5},
+      "needs-input": {"title": "Needs Input", "order": 6},
+      "done":        {"title": "Done",        "order": 7}
+    }
+  },
+  "user": {
+    "atlassian_account_id": "__ACCOUNT_ID__",
+    "display_name": "__DISPLAY_NAME__",
+    "first_name_lower": "__FIRST_NAME__"
+  },
+  "credentials": {
+    "email": "__EMAIL__",
+    "token": "__TOKEN__"
+  },
+  "triage": {
+    "priority_signals": {
+      "p0_keywords": ["P0", "target EOD", "need to address today", "urgent", "critical"],
+      "p1_keywords": ["P1", "okay to land next week", "high"],
+      "blocked_keywords": ["waiting on", "awaiting(?! review)", "blocked(?! on)", "need.*LGTM", "still investigating"],
+      "on_hold_keywords": ["on hold", "on pause", "will revisit", "paused", "low priority"],
+      "done_keywords": ["landed", "completed", "live in", "published", "closed", "done"],
+      "in_progress_keywords": ["in progress", "working on", "investigating today", "will.*today", "target.*today", "target.*eod", "to investigate", "to complete.*eod", "looking into today"],
+      "in_review_keywords": ["reviewed by", "under review", "in review", "awaiting review", "needs? review", "diff in.*review", "submitted for", "re-review", "to review", "to smoke test", "accepted", "LGTM", "DRS review", "Meta Review"],
+      "needs_input_keywords": ["question", "decision needed", "approve", "approval request", "needs owner decision", "clarify"]
+    },
+    "highlight_colors": {
+      "#fff0b3": "on-hold",
+      "#fffae6": "on-hold"
+    }
+  }
+}
