@@ -187,43 +187,62 @@ def extract_new_content(current_text, synced_text):
     return new_lines
 
 
+_GENERIC_WORDS = {
+    "the", "and", "for", "from", "with", "that", "this", "have", "will",
+    "form", "submission", "dataset", "self", "service", "request", "update",
+    "task", "issue", "item", "action", "status", "review", "work", "data",
+    "test", "page", "note", "info", "detail", "report", "meeting", "call",
+}
+
+
+def _rank_word_distinctiveness(word):
+    """Higher score = more distinctive, better search candidate."""
+    w = word.lower()
+    if w in _GENERIC_WORDS:
+        return 0
+    score = len(word)
+    if any(c.isupper() for c in word[1:]):
+        score += 20
+    if not word.isascii():
+        score += 10
+    return score
+
+
 def find_confluence_row_ending(html, task_title):
     """Find the end of the status cell for a task row in Confluence HTML.
 
-    Returns (match_position, old_ending) where old_ending is the </td></tr>
-    preceded by the last </p> in the status cell, or None if not found.
+    Returns insert position after the last </p> in the status cell, or None.
     """
     title_clean = task_title.split("[")[-1].split("]")[-1].strip() if "[" in task_title else task_title
-    title_words = [w for w in title_clean.split() if len(w) > 3][:4]
+    raw_words = [re.sub(r'["\'\(\)\[\],;:]+', '', w) for w in title_clean.split()]
+    title_words = [w for w in raw_words if len(w) > 3][:6]
 
     if not title_words:
         return None
 
-    search_term = title_words[0]
-    for word in title_words:
-        if word.lower() not in ("the", "and", "for", "from", "with"):
-            search_term = word
-            break
+    candidates = sorted(title_words, key=_rank_word_distinctiveness, reverse=True)
 
-    idx = html.find(search_term)
-    attempts = 0
-    while idx >= 0 and attempts < 20:
-        tr_start = html.rfind("<tr", 0, idx)
-        tr_end = html.find("</tr>", idx)
-        if tr_start >= 0 and tr_end >= 0:
-            row = html[tr_start:tr_end + 5]
-            if all(w in row for w in title_words[:3]):
-                cells = list(re.finditer(r'<td[^>]*>', row))
-                if len(cells) >= 2:
-                    status_cell_start = cells[1].start()
-                    status_cell_rel_end = row.find("</td>", status_cell_start)
-                    if status_cell_rel_end >= 0:
-                        last_p_end = row.rfind("</p>", status_cell_start, status_cell_rel_end)
-                        if last_p_end >= 0:
-                            abs_pos = tr_start + last_p_end + 4
-                            return abs_pos
-        idx = html.find(search_term, idx + 1)
-        attempts += 1
+    for search_term in candidates:
+        idx = html.find(search_term)
+        attempts = 0
+        while idx >= 0 and attempts < 30:
+            tr_start = html.rfind("<tr", 0, idx)
+            tr_end = html.find("</tr>", idx)
+            if tr_start >= 0 and tr_end >= 0:
+                row = html[tr_start:tr_end + 5]
+                match_count = sum(1 for w in title_words if w in row)
+                if match_count >= min(3, len(title_words)):
+                    cells = list(re.finditer(r'<td[^>]*>', row))
+                    if len(cells) >= 2:
+                        status_cell_start = cells[1].start()
+                        status_cell_rel_end = row.find("</td>", status_cell_start)
+                        if status_cell_rel_end >= 0:
+                            last_p_end = row.rfind("</p>", status_cell_start, status_cell_rel_end)
+                            if last_p_end >= 0:
+                                abs_pos = tr_start + last_p_end + 4
+                                return abs_pos
+            idx = html.find(search_term, idx + 1)
+            attempts += 1
 
     return None
 
