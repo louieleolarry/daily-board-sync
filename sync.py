@@ -155,8 +155,12 @@ def find_weekly_page(config, auth, week_date):
 # ---------------------------------------------------------------------------
 
 def strip_html_tags(html_str):
-    """Strip HTML tags to get plain text for comparison."""
-    return re.sub(r'<[^>]+>', '', html_str).strip()
+    """Strip HTML tags to get plain text, preserving line breaks."""
+    text = re.sub(r'<br\s*/?>', '\n', html_str)
+    text = re.sub(r'</(?:div|p|li|tr)>', '\n', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 def extract_new_content(current_text, synced_text):
@@ -245,6 +249,62 @@ def find_confluence_row_ending(html, task_title):
             attempts += 1
 
     return None
+
+
+def detect_new_wfs_cards(board_cards, state):
+    """Find WFS cards that don't match any saved state entry."""
+    synced_titles = {s["title"] for s in state.get("cards", {}).values()}
+    new_cards = []
+    for card in board_cards:
+        title = card.get("title", "")
+        if title and title not in synced_titles:
+            new_cards.append(card)
+    return new_cards
+
+
+def insert_new_confluence_row(html, section_name, task_title, status_text, user_account_id):
+    """Insert a new task row at the top of a section's table in Confluence HTML."""
+    pattern = f'<ac:parameter ac:name="title">{re.escape(section_name)}</ac:parameter>'
+    section_match = re.search(pattern, html)
+    if not section_match:
+        return None
+
+    table_start = html.find('<table', section_match.start())
+    if table_start < 0:
+        return None
+    table_end = html.find('</table>', table_start)
+    if table_end < 0:
+        return None
+
+    first_tr_end = html.find('</tr>', table_start)
+    if first_tr_end < 0:
+        return None
+    insert_pos = first_tr_end + 5
+
+    lid1 = uuid.uuid4().hex[:8]
+    lid2 = uuid.uuid4().hex[:8]
+    lid3 = uuid.uuid4().hex[:8]
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    user_tag = (
+        f'<ac:link><ri:user ri:account-id="{user_account_id}"/></ac:link>'
+    )
+
+    status_lines = [l.strip() for l in status_text.split('\n') if l.strip()]
+    status_html = f'<p local-id="{lid3}"><time datetime="{today}" /></p>'
+    for line in status_lines:
+        slid = uuid.uuid4().hex[:8]
+        status_html += f'<p local-id="{slid}">{line}</p>'
+
+    new_row = (
+        f'<tr>'
+        f'<td><p local-id="{lid1}">{task_title}</p>'
+        f'<p local-id="{lid2}">{user_tag}</p></td>'
+        f'<td>{status_html}</td>'
+        f'</tr>'
+    )
+
+    return html[:insert_pos] + new_row + html[insert_pos:]
 
 
 def push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=False):
@@ -641,13 +701,14 @@ def build_card_html(task):
     return "<div>" + "</div><div>".join(parts) + "</div>"
 
 
-def sync_board(tasks, config, dry_run=False):
+def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
     """Clear board and repopulate with triaged tasks. Returns card state for saving."""
     board_id = config["board"]["board_id"]
     api_base = config["board"]["api_base"]
     today = datetime.now().strftime("%Y-%m-%d")
     all_columns = config["board"]["all_columns"]
     permanent = set(config["board"]["permanent_columns"])
+    protected = set(protected_card_ids or [])
 
     classified = []
     for task in tasks:
@@ -681,9 +742,18 @@ def sync_board(tasks, config, dry_run=False):
     board_docs = [d for d in existing if d.get("boardId") == board_id]
 
     if not dry_run:
+        deleted = 0
+        preserved = 0
         for doc in board_docs:
-            api_request(f"{api_base}/documents/{doc['_id']}", method="DELETE")
-        print(f"  Cleared {len(board_docs)} existing cards")
+            if doc["_id"] in protected:
+                preserved += 1
+            else:
+                api_request(f"{api_base}/documents/{doc['_id']}", method="DELETE")
+                deleted += 1
+        msg = f"  Cleared {deleted} existing cards"
+        if preserved:
+            msg += f" (preserved {preserved} WFS-only)"
+        print(msg)
 
     columns_order = [c["key"] for c in active_columns]
     created = 0
@@ -911,6 +981,8 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed output")
     parser.add_argument("--push-only", action="store_true", help="Only push WFS changes to Confluence")
     parser.add_argument("--pull-only", action="store_true", help="Only pull Confluence to WFS")
+    parser.add_argument("--approve-new", action="store_true", help="Insert new WFS-only cards into Confluence")
+    parser.add_argument("--section", help="Confluence section for new tasks (e.g. 'AI', 'Family Center')")
     parser.add_argument("--setup", action="store_true", help="Run first-time setup wizard")
     args = parser.parse_args()
 
@@ -943,6 +1015,7 @@ def main():
     print(f"  Page: {page['title']} (id={page['id']}, v{page['version']['number']})")
 
     # --- Step 1: Reverse sync (WFS → Confluence) ---
+    pending_new_card_ids = []
     if not args.pull_only:
         print("  Checking WFS board for edits to push back...")
         state = load_state()
@@ -957,6 +1030,62 @@ def main():
             print("  Re-fetching Confluence page after push...")
             page = find_weekly_page(config, auth, week_date)
             html_content = page["body"]["storage"]["value"]
+
+        new_cards = detect_new_wfs_cards(board_cards, state)
+        if new_cards:
+            if args.approve_new:
+                section = (
+                    args.section
+                    or config.get("board", {}).get("default_new_task_section")
+                    or config.get("confluence", {}).get("sections", ["General"])[0]
+                )
+                print(f"  Inserting {len(new_cards)} new task(s) into Confluence section '{section}'...")
+                html = page["body"]["storage"]["value"]
+                version = page["version"]["number"]
+                user_id = config["user"]["atlassian_account_id"]
+                inserted = 0
+                for card in new_cards:
+                    status = strip_html_tags(card.get("text", "")).strip() or "Added from WFS board"
+                    result_html = insert_new_confluence_row(html, section, card["title"], status, user_id)
+                    if result_html:
+                        html = result_html
+                        inserted += 1
+                        print(f"    + {card['title']}")
+                    else:
+                        print(f"    WARN: Could not find section '{section}' for: {card['title']}", file=sys.stderr)
+
+                if inserted and not args.dry_run:
+                    base = config["confluence"]["base_url"]
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    update_payload = {
+                        "id": page["id"],
+                        "type": "page",
+                        "title": page["title"],
+                        "body": {"storage": {"value": html, "representation": "storage"}},
+                        "version": {
+                            "number": version + 1,
+                            "message": f"daily-board-sync: added {inserted} new task(s) from WFS ({today})"
+                        }
+                    }
+                    result = api_request(
+                        f"{base}/wiki/rest/api/content/{page['id']}",
+                        method="PUT", data=update_payload, auth=auth
+                    )
+                    if result:
+                        print(f"  Confluence updated to version {result['version']['number']}")
+                        page = find_weekly_page(config, auth, week_date)
+                        html_content = page["body"]["storage"]["value"]
+                    else:
+                        print("  WARN: Confluence update failed", file=sys.stderr)
+            else:
+                print(f"  PENDING: {len(new_cards)} new WFS-only card(s) not in Confluence:")
+                for card in new_cards:
+                    text_preview = strip_html_tags(card.get("text", "")).strip()[:80]
+                    print(f"    • {card['title']}")
+                    if text_preview:
+                        print(f"      {text_preview}")
+                print("  Re-run with --approve-new [--section SECTION] to add to Confluence.")
+                pending_new_card_ids = [c["_id"] for c in new_cards]
 
     if args.push_only:
         print("  Done (push-only mode).")
@@ -1002,7 +1131,7 @@ def main():
             print(f"    [{role:8s}] [{t['section']:20s}] {t['title']}")
 
     print("  Triaging and syncing board...")
-    classified, card_state = sync_board(tasks, config, dry_run=args.dry_run)
+    classified, card_state = sync_board(tasks, config, dry_run=args.dry_run, protected_card_ids=pending_new_card_ids)
 
     if not args.dry_run and card_state:
         save_state({
