@@ -52,18 +52,10 @@ def save_state(state):
 
 
 def load_credentials(config):
-    creds = config.get("credentials", {})
-    if creds.get("email") and creds.get("token"):
-        return creds["email"], creds["token"]
-    creds_source = config.get("confluence", {}).get("credentials_source", "")
-    if creds_source:
-        creds_path = Path(creds_source).expanduser()
-        if creds_path.exists():
-            with open(creds_path) as f:
-                jira_config = json.load(f)
-            return jira_config["jira"]["email"], jira_config["jira"]["token"]
-    print("  ERROR: No credentials found. Run: python3 sync.py --setup", file=sys.stderr)
-    sys.exit(1)
+    creds_path = Path(config["confluence"]["credentials_source"]).expanduser()
+    with open(creds_path) as f:
+        jira_config = json.load(f)
+    return jira_config["jira"]["email"], jira_config["jira"]["token"]
 
 
 def api_request(url, method="GET", data=None, auth=None):
@@ -159,6 +151,16 @@ def strip_html_tags(html_str):
     text = re.sub(r'<br\s*/?>', '\n', html_str)
     text = re.sub(r'</(?:div|p|li|tr)>', '\n', text)
     text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'&nbsp;', ' ', text)
+    text = re.sub(r'&mdash;', '—', text)
+    text = re.sub(r'&ldquo;', '"', text)
+    text = re.sub(r'&rdquo;', '"', text)
+    text = re.sub(r'&rsquo;', "'", text)
+    text = re.sub(r'&lsquo;', "'", text)
+    text = re.sub(r'&amp;', '&', text)
+    text = re.sub(r'&lt;', '<', text)
+    text = re.sub(r'&gt;', '>', text)
+    text = re.sub(r'&quot;', '"', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -180,13 +182,21 @@ def extract_new_content(current_text, synced_text):
         if new_part:
             return [line.strip() for line in new_part.split("\n") if line.strip()]
 
+    def normalize(line):
+        s = re.sub(r'\s+', ' ', line).strip()
+        return s.rstrip('-').strip()
+
     current_lines = [l.strip() for l in current_plain.split("\n") if l.strip()]
     synced_lines = [l.strip() for l in synced_plain.split("\n") if l.strip()]
+    synced_normalized = {normalize(l) for l in synced_lines}
 
     new_lines = []
+    seen = set()
     for line in current_lines:
-        if line not in synced_lines:
+        norm = normalize(line)
+        if norm and norm not in synced_normalized and norm not in seen:
             new_lines.append(line)
+            seen.add(norm)
 
     return new_lines
 
@@ -212,11 +222,47 @@ def _rank_word_distinctiveness(word):
     return score
 
 
-def find_confluence_row_ending(html, task_title):
+def find_row_by_local_id(html, local_id):
+    """Find a <tr> element by its ac:local-id attribute.
+    Returns (tr_start, tr_end_inclusive) or (None, None).
+    """
+    marker = f'ac:local-id="{local_id}"'
+    idx = html.find(marker)
+    if idx < 0:
+        return None, None
+    tr_start = html.rfind("<tr", 0, idx)
+    tr_end = html.find("</tr>", idx)
+    if tr_start >= 0 and tr_end >= 0:
+        return tr_start, tr_end + 5
+    return None, None
+
+
+def _extract_row_insert_pos(html, tr_start, tr_end):
+    """Given row boundaries, return insert position after last </p> in status cell."""
+    row = html[tr_start:tr_end]
+    cells = list(re.finditer(r'<td[^>]*>', row))
+    if len(cells) >= 2:
+        status_cell_start = cells[1].start()
+        status_cell_rel_end = row.find("</td>", status_cell_start)
+        if status_cell_rel_end >= 0:
+            last_p_end = row.rfind("</p>", status_cell_start, status_cell_rel_end)
+            if last_p_end >= 0:
+                return tr_start + last_p_end + 4
+    return None
+
+
+def find_confluence_row_ending(html, task_title, row_local_id=None):
     """Find the end of the status cell for a task row in Confluence HTML.
 
     Returns insert position after the last </p> in the status cell, or None.
     """
+    if row_local_id:
+        tr_start, tr_end = find_row_by_local_id(html, row_local_id)
+        if tr_start is not None:
+            pos = _extract_row_insert_pos(html, tr_start, tr_end)
+            if pos is not None:
+                return pos
+
     title_clean = task_title.split("[")[-1].split("]")[-1].strip() if "[" in task_title else task_title
     raw_words = [re.sub(r'["\'\(\)\[\],;:]+', '', w) for w in title_clean.split()]
     title_words = [w for w in raw_words if len(w) > 3][:6]
@@ -251,6 +297,54 @@ def find_confluence_row_ending(html, task_title):
     return None
 
 
+def set_row_highlight(html, task_title, color, row_local_id=None):
+    """Set or remove data-highlight-colour on a Confluence task row's <td> cells.
+
+    color: hex string (e.g. "#fff0b3") to set, or None to remove highlight.
+    Returns modified HTML, or None if the row was not found or no change needed.
+    """
+    if row_local_id:
+        tr_start, tr_end = find_row_by_local_id(html, row_local_id)
+        if tr_start is not None:
+            row = html[tr_start:tr_end]
+            modified = re.sub(r'\s*data-highlight-colour="[^"]*"', '', row)
+            if color:
+                modified = re.sub(r'<td\b', f'<td data-highlight-colour="{color}"', modified)
+            if modified != row:
+                return html[:tr_start] + modified + html[tr_end:]
+            return None
+
+    title_clean = task_title.split("[")[-1].split("]")[-1].strip() if "[" in task_title else task_title
+    raw_words = [re.sub(r'["\'\(\)\[\],;:]+', '', w) for w in title_clean.split()]
+    title_words = [w for w in raw_words if len(w) > 3][:6]
+
+    if not title_words:
+        return None
+
+    candidates = sorted(title_words, key=_rank_word_distinctiveness, reverse=True)
+
+    for search_term in candidates:
+        idx = html.find(search_term)
+        attempts = 0
+        while idx >= 0 and attempts < 30:
+            tr_start = html.rfind("<tr", 0, idx)
+            tr_end = html.find("</tr>", idx)
+            if tr_start >= 0 and tr_end >= 0:
+                row = html[tr_start:tr_end + 5]
+                match_count = sum(1 for w in title_words if w in row)
+                if match_count >= min(3, len(title_words)):
+                    modified = re.sub(r'\s*data-highlight-colour="[^"]*"', '', row)
+                    if color:
+                        modified = re.sub(r'<td\b', f'<td data-highlight-colour="{color}"', modified)
+                    if modified != row:
+                        return html[:tr_start] + modified + html[tr_end + 5:]
+                    return None
+            idx = html.find(search_term, idx + 1)
+            attempts += 1
+
+    return None
+
+
 def detect_new_wfs_cards(board_cards, state):
     """Find WFS cards that don't match any saved state entry."""
     synced_titles = {s["title"] for s in state.get("cards", {}).values()}
@@ -263,7 +357,7 @@ def detect_new_wfs_cards(board_cards, state):
 
 
 def insert_new_confluence_row(html, section_name, task_title, status_text, user_account_id):
-    """Insert a new task row at the top of a section's table in Confluence HTML."""
+    """Insert a new task row into a section's table in Confluence HTML."""
     pattern = f'<ac:parameter ac:name="title">{re.escape(section_name)}</ac:parameter>'
     section_match = re.search(pattern, html)
     if not section_match:
@@ -289,7 +383,6 @@ def insert_new_confluence_row(html, section_name, task_title, status_text, user_
     user_tag = (
         f'<ac:link><ri:user ri:account-id="{user_account_id}"/></ac:link>'
     )
-
     status_lines = [l.strip() for l in status_text.split('\n') if l.strip()]
     status_html = f'<p local-id="{lid3}"><time datetime="{today}" /></p>'
     for line in status_lines:
@@ -315,10 +408,13 @@ def push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=F
 
     synced_cards = state.get("cards", {})
     updates = []
+    highlight_updates = []
+    column_to_highlight = config["triage"].get("column_to_highlight", {})
 
     for card in board_cards:
         card_title = card.get("title", "")
         card_text = card.get("text", "")
+        card_status = card.get("status", "")
 
         matched_key = None
         for key, saved in synced_cards.items():
@@ -330,6 +426,28 @@ def push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=F
             continue
 
         saved = synced_cards[matched_key]
+
+        old_status = saved.get("status", "")
+        if card_status != old_status:
+            if card_status in column_to_highlight:
+                highlight_updates.append({
+                    "title": card_title,
+                    "confluence_title": saved.get("confluence_title", card_title),
+                    "color": column_to_highlight[card_status],
+                    "from": old_status,
+                    "to": card_status,
+                    "row_local_id": saved.get("row_local_id", ""),
+                })
+            elif old_status in column_to_highlight:
+                highlight_updates.append({
+                    "title": card_title,
+                    "confluence_title": saved.get("confluence_title", card_title),
+                    "color": None,
+                    "from": old_status,
+                    "to": card_status,
+                    "row_local_id": saved.get("row_local_id", ""),
+                })
+
         if card.get("updatedAt") == card.get("createdAt"):
             continue
 
@@ -339,9 +457,10 @@ def push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=F
                 "title": card_title,
                 "confluence_title": saved.get("confluence_title", card_title),
                 "new_lines": new_lines,
+                "row_local_id": saved.get("row_local_id", ""),
             })
 
-    if not updates:
+    if not updates and not highlight_updates:
         print("  No WFS edits to push to Confluence")
         return False
 
@@ -356,7 +475,7 @@ def push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=F
                 print(f"    + {line}")
             continue
 
-        insert_pos = find_confluence_row_ending(html, update["confluence_title"])
+        insert_pos = find_confluence_row_ending(html, update["confluence_title"], row_local_id=update.get("row_local_id"))
         if insert_pos is None:
             print(f"  WARN: Could not find Confluence row for '{update['title']}'", file=sys.stderr)
             continue
@@ -369,6 +488,22 @@ def push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=F
         html = html[:insert_pos] + new_p_tags + html[insert_pos:]
         modified = True
         print(f"  Pushed to Confluence: {update['title']} (+{len(update['new_lines'])} lines)")
+
+    for h_update in highlight_updates:
+        if dry_run:
+            color_name = "yellow (blocked)" if h_update["color"] == "#fff0b3" else \
+                         "blue (done)" if h_update["color"] == "#deebff" else "remove"
+            print(f"  WOULD SET HIGHLIGHT: {h_update['title']} → {color_name}")
+            continue
+
+        result = set_row_highlight(html, h_update["confluence_title"], h_update["color"], row_local_id=h_update.get("row_local_id"))
+        if result is not None:
+            html = result
+            modified = True
+            color_desc = h_update["color"] or "none"
+            print(f"  Highlight updated: {h_update['title']} ({h_update['from']} → {h_update['to']}, color={color_desc})")
+        else:
+            print(f"  WARN: Could not find/update highlight for '{h_update['title']}'", file=sys.stderr)
 
     if modified and not dry_run:
         base = config["confluence"]["base_url"]
@@ -455,6 +590,7 @@ class ConfluenceTaskParser(HTMLParser):
             self._row_mentions_target = False
             self._is_header_row = False
             self._highlight_color = None
+            self._row_local_id = attr_dict.get("ac:local-id", "")
 
         if tag in ("td", "th") and self._in_row:
             self._in_cell = True
@@ -526,9 +662,7 @@ class ConfluenceTaskParser(HTMLParser):
         if tag == "tr" and self._in_table:
             self._in_row = False
             if not self._is_header_row and self._row_data["title_text"].strip():
-                target_name_lower = config.get("user", {}).get("first_name_lower", "")
-                if not target_name_lower:
-                    target_name_lower = config.get("user", {}).get("display_name", "").split()[0].lower()
+                target_name_lower = "brad"
                 status_lower = self._row_data["status_text"].lower()
                 title_lower = self._row_data["title_text"].lower()
                 if target_name_lower in status_lower or target_name_lower in title_lower:
@@ -541,6 +675,7 @@ class ConfluenceTaskParser(HTMLParser):
                         "status_text": self._row_data["status_text"],
                         "section": self.current_section,
                         "highlight_color": self._highlight_color,
+                        "row_local_id": self._row_local_id,
                         "is_assigned": self._row_has_target_user,
                         "is_mentioned": self._row_mentions_target and not self._row_has_target_user,
                         "links": {
@@ -604,12 +739,7 @@ def classify_status(task, config):
     combined = f"{title} {status}"
 
     if task["highlight_color"] in config["triage"].get("highlight_colors", {}):
-        mapped = config["triage"]["highlight_colors"][task["highlight_color"]]
-        if any(re.search(kw, combined) for kw in signals["on_hold_keywords"]):
-            return "on-hold"
-        if any(re.search(kw, combined) for kw in signals["blocked_keywords"]):
-            return "blocked"
-        return mapped
+        return config["triage"]["highlight_colors"][task["highlight_color"]]
 
     if any(re.search(kw, combined) for kw in signals["done_keywords"]):
         if "need" not in combined and "waiting" not in combined:
@@ -691,12 +821,12 @@ def build_card_html(task):
         latest = date_sections[-1].strip()
         latest = re.sub(r'^\d{4}-\d{2}-\d{2}\s*', '', latest).strip()
         if latest:
-            parts.append(f"<b>Latest:</b> {latest}")
+            parts.append(f"<b>Latest:</b> {latest.replace(chr(10), '<br>')}")
     elif status_lines:
         cleaned = re.sub(r'\d{4}-\d{2}-\d{2}\s*', '', status_lines).strip()
         cleaned = re.sub(r'\n-+\n', '\n', cleaned)
         if cleaned:
-            parts.append(f"<b>Status:</b> {cleaned}")
+            parts.append(f"<b>Status:</b> {cleaned.replace(chr(10), '<br>')}")
 
     return "<div>" + "</div><div>".join(parts) + "</div>"
 
@@ -785,193 +915,14 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
                         "confluence_title": task["title_full"].split("\n")[0].strip(),
                         "text": card_html,
                         "status": col_key,
+                        "row_local_id": task.get("row_local_id", ""),
+                        "section": task.get("section", ""),
                     }
 
     if not dry_run:
         print(f"  Created {created} cards across {len(columns_order)} columns")
 
     return classified, card_state
-
-
-def run_setup():
-    """Interactive setup wizard for first-time configuration."""
-    print("=" * 60)
-    print("  Daily Board Sync — First-Time Setup")
-    print("=" * 60)
-    print()
-
-    # 1. Atlassian credentials
-    print("Step 1: Atlassian API Token")
-    print("-" * 40)
-    print("Generate a token at:")
-    print("  https://id.atlassian.com/manage-profile/security/api-tokens")
-    print()
-
-    import webbrowser
-    open_browser = input("Open that page in your browser now? [Y/n] ").strip().lower()
-    if open_browser != "n":
-        webbrowser.open("https://id.atlassian.com/manage-profile/security/api-tokens")
-        print("  Opened in browser. Create a token labeled 'daily-board-sync'.")
-        print()
-
-    email = input("Your Atlassian email: ").strip()
-    token = input("Your API token: ").strip()
-
-    if not email or not token:
-        print("ERROR: Email and token are required.")
-        sys.exit(1)
-
-    # Validate credentials and get account info
-    print("\n  Validating credentials...")
-    cred = b64encode(f"{email}:{token}".encode()).decode()
-    headers = {"Authorization": f"Basic {cred}", "Content-Type": "application/json"}
-
-    try:
-        req = urllib.request.Request(
-            "https://codazen.atlassian.net/rest/api/3/myself",
-            headers=headers
-        )
-        with urllib.request.urlopen(req) as resp:
-            user_data = json.loads(resp.read().decode())
-    except urllib.error.HTTPError:
-        alt_url = input("Default org (codazen) failed. Enter your Atlassian URL\n  (e.g., https://yourorg.atlassian.net): ").strip().rstrip("/")
-        try:
-            req = urllib.request.Request(f"{alt_url}/rest/api/3/myself", headers=headers)
-            with urllib.request.urlopen(req) as resp:
-                user_data = json.loads(resp.read().decode())
-        except Exception as e:
-            print(f"ERROR: Could not validate credentials: {e}")
-            sys.exit(1)
-    else:
-        alt_url = "https://codazen.atlassian.net"
-
-    account_id = user_data["accountId"]
-    display_name = user_data["displayName"]
-    first_name = display_name.split()[0].lower()
-    print(f"  Authenticated as: {display_name} ({account_id})")
-
-    # 2. Confluence space and sections
-    print(f"\nStep 2: Confluence Configuration")
-    print("-" * 40)
-    space_key = input(f"Confluence space key [TEAM]: ").strip() or "TEAM"
-
-    print("Enter the project section names from your weekly standup page")
-    print("(comma-separated, e.g.: Family Center, AI, MDC)")
-    sections_input = input("Sections: ").strip()
-    sections = [s.strip() for s in sections_input.split(",") if s.strip()]
-
-    if not sections:
-        print("ERROR: At least one section is required.")
-        sys.exit(1)
-
-    # 3. Create WFS board
-    print(f"\nStep 3: WorkflowShortcuts Board")
-    print("-" * 40)
-    board_name = input(f"Board name [{first_name.title()} Daily]: ").strip()
-    if not board_name:
-        board_name = f"{first_name.title()} Daily"
-
-    print(f"  Creating board '{board_name}'...")
-    board_data = {
-        "title": board_name,
-        "text": f"Daily task board for {display_name}. Auto-synced from Confluence.",
-        "columns": [
-            {"key": "todo", "title": "Todo"},
-            {"key": "in-progress", "title": "In Progress"},
-            {"key": "done", "title": "Done"}
-        ]
-    }
-    req = urllib.request.Request(
-        "https://workflowshortcuts.com/api/boards",
-        data=json.dumps(board_data).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            board = json.loads(resp.read().decode())
-        board_id = board["_id"]
-        print(f"  Board created: https://workflowshortcuts.com/?boardId={board_id}")
-    except Exception as e:
-        print(f"ERROR: Could not create board: {e}")
-        board_id = input("Enter an existing board ID instead: ").strip()
-
-    # 4. Write config
-    template_path = SCRIPT_DIR / "config.template.json"
-    with open(template_path) as f:
-        config = json.load(f)
-
-    config["confluence"]["base_url"] = alt_url
-    config["confluence"]["space_key"] = space_key
-    config["confluence"]["sections"] = sections
-    config["board"]["board_id"] = board_id
-    config["user"]["atlassian_account_id"] = account_id
-    config["user"]["display_name"] = display_name
-    config["user"]["first_name_lower"] = first_name
-    config["credentials"]["email"] = email
-    config["credentials"]["token"] = token
-
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(config, f, indent=2)
-
-    print(f"\nStep 4: Configuration saved to {CONFIG_PATH}")
-
-    # 5. Cron setup
-    print(f"\nStep 5: Scheduled Sync (optional)")
-    print("-" * 40)
-    setup_cron = input("Set up daily 6AM weekday sync? [Y/n] ").strip().lower()
-    if setup_cron != "n":
-        plist_name = f"com.daily-board-sync.{first_name}.plist"
-        plist_path = Path.home() / "Library" / "LaunchAgents" / plist_name
-        python_path = sys.executable
-        script_path = SCRIPT_DIR / "sync.py"
-        log_path = SCRIPT_DIR / "sync.log"
-
-        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.daily-board-sync.{first_name}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{python_path}</string>
-        <string>{script_path}</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <array>
-        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
-    </array>
-    <key>StandardOutPath</key>
-    <string>{log_path}</string>
-    <key>StandardErrorPath</key>
-    <string>{log_path}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin</string>
-    </dict>
-</dict>
-</plist>"""
-
-        with open(plist_path, "w") as f:
-            f.write(plist_content)
-
-        print(f"  Plist written to: {plist_path}")
-        print(f"  To activate, run:")
-        print(f"    launchctl load {plist_path}")
-
-    # Done
-    print()
-    print("=" * 60)
-    print("  Setup complete!")
-    print(f"  Board: https://workflowshortcuts.com/?boardId={board_id}")
-    print(f"  Run your first sync: python3 {SCRIPT_DIR / 'sync.py'}")
-    print("=" * 60)
 
 
 def main():
@@ -983,18 +934,7 @@ def main():
     parser.add_argument("--pull-only", action="store_true", help="Only pull Confluence to WFS")
     parser.add_argument("--approve-new", action="store_true", help="Insert new WFS-only cards into Confluence")
     parser.add_argument("--section", help="Confluence section for new tasks (e.g. 'AI', 'Family Center')")
-    parser.add_argument("--setup", action="store_true", help="Run first-time setup wizard")
     args = parser.parse_args()
-
-    if args.setup:
-        run_setup()
-        return
-
-    if not CONFIG_PATH.exists():
-        print("No config.json found. Running first-time setup...")
-        print()
-        run_setup()
-        return
 
     config = load_config()
     email, token = load_credentials(config)
@@ -1034,11 +974,7 @@ def main():
         new_cards = detect_new_wfs_cards(board_cards, state)
         if new_cards:
             if args.approve_new:
-                section = (
-                    args.section
-                    or config.get("board", {}).get("default_new_task_section")
-                    or config.get("confluence", {}).get("sections", ["General"])[0]
-                )
+                section = args.section or config.get("board", {}).get("default_new_task_section", "AI")
                 print(f"  Inserting {len(new_cards)} new task(s) into Confluence section '{section}'...")
                 html = page["body"]["storage"]["value"]
                 version = page["version"]["number"]
@@ -1094,10 +1030,10 @@ def main():
     # --- Step 2: Forward sync (Confluence → WFS) ---
     print("  Parsing tasks...")
 
-    top_level_sections = config.get("confluence", {}).get("sections", [])
-    if not top_level_sections:
-        print("  ERROR: No sections configured. Run: python3 sync.py --setup", file=sys.stderr)
-        sys.exit(1)
+    top_level_sections = [
+        "Family Center", "Workplace Deprecation", "AI for Good",
+        "AI", "MDC", "Engineering Services R&D"
+    ]
 
     def find_section_ranges(html, sections):
         ranges = []
@@ -1123,6 +1059,9 @@ def main():
         all_tasks.extend(task_parser.tasks)
 
     tasks = all_tasks
+    exclude = config.get("exclude_tasks", [])
+    if exclude:
+        tasks = [t for t in tasks if t["title"] not in exclude]
     print(f"  Found {len(tasks)} tasks for {config['user']['display_name']}")
 
     if args.verbose:

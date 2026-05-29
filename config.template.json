@@ -41,8 +41,14 @@
       "needs_input_keywords": ["question", "decision needed", "approve", "approval request", "needs owner decision", "clarify"]
     },
     "highlight_colors": {
-      "#fff0b3": "on-hold",
-      "#fffae6": "on-hold"
+      "#fff0b3": "blocked",
+      "#fffae6": "blocked",
+      "#deebff": "done",
+      "#b3d4ff": "done"
+    },
+    "column_to_highlight": {
+      "blocked": "#fff0b3",
+      "done": "#deebff"
     }
   }
 }
