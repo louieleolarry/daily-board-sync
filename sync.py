@@ -91,7 +91,7 @@ def api_request(url, method="GET", data=None, auth=None, extra_headers=None):
 
 def get_wfs_token(config):
     board_config = config.get("board", {})
-    token = str(board_config.get("api_token") or "").strip()
+    token = str(board_config.get("bot_token") or board_config.get("api_token") or "").strip()
 
     if token:
         return token
@@ -120,7 +120,7 @@ def wfs_request(config, path, method="GET", data=None):
     headers = {}
 
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers["X-Bot-Token"] = token
 
     return api_request(url, method=method, data=data, extra_headers=headers)
 
@@ -950,16 +950,15 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
     existing_index = build_existing_card_index(board_docs, state)
     used_existing_ids = set()
 
-    state = load_state()
-    saved_status_by_title = {}
-    for card_info in state.get("cards", {}).values():
-        if card_info.get("title") and card_info.get("status"):
-            saved_status_by_title[card_info["title"]] = card_info["status"]
+    live_status_by_title = {}
+    for card in board_docs:
+        if card.get("title") and card.get("status"):
+            live_status_by_title[card["title"]] = card["status"]
 
     classified = []
     preserved_count = 0
     for task in tasks:
-        saved_col = saved_status_by_title.get(task["title"])
+        saved_col = live_status_by_title.get(task["title"])
         if saved_col and saved_col in all_columns:
             col = saved_col
             preserved_count += 1
@@ -1057,7 +1056,6 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
                     })
                 else:
                     result = wfs_request(config, "documents", method="POST", data=card)
-
                 if result:
                     if existing_doc:
                         updated += 1
