@@ -869,13 +869,78 @@ def build_card_html(task):
     return "<div>" + "</div><div>".join(parts) + "</div>"
 
 
+def normalize_match_key(value):
+    value = strip_html_tags(str(value or "")).lower()
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def task_match_keys(task):
+    keys = []
+    row_local_id = str(task.get("row_local_id") or "").strip()
+    if row_local_id:
+        keys.append(f"row:{row_local_id}")
+
+    for value in (task.get("title_full"), task.get("title")):
+        key = normalize_match_key(value)
+        if key:
+            keys.append(f"title:{key}")
+
+    return keys
+
+
+def build_existing_card_index(board_docs, state):
+    index = {}
+    synced_cards = state.get("cards", {})
+
+    for doc in board_docs:
+        doc_id = str(doc.get("_id") or "")
+        saved = synced_cards.get(doc_id, {})
+        keys = []
+
+        row_local_id = str(saved.get("row_local_id") or "").strip()
+        if row_local_id:
+            keys.append(f"row:{row_local_id}")
+
+        for value in (
+            saved.get("confluence_title"),
+            saved.get("title"),
+            doc.get("title"),
+        ):
+            key = normalize_match_key(value)
+            if key:
+                keys.append(f"title:{key}")
+
+        for key in keys:
+            index.setdefault(key, doc)
+
+    return index
+
+
+def find_existing_card(task, existing_index, used_card_ids):
+    for key in task_match_keys(task):
+        doc = existing_index.get(key)
+        doc_id = str(doc.get("_id") or "") if doc else ""
+        if doc and doc_id and doc_id not in used_card_ids:
+            used_card_ids.add(doc_id)
+            return doc
+
+    return None
+
+
 def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
-    """Clear board and repopulate with triaged tasks. Returns card state for saving."""
+    """Sync triaged tasks to the board while preserving existing card progress."""
     board_id = config["board"]["board_id"]
     today = datetime.now().strftime("%Y-%m-%d")
     all_columns = config["board"]["all_columns"]
     permanent = set(config["board"]["permanent_columns"])
     protected = set(protected_card_ids or [])
+    state = load_state()
+
+    existing = wfs_request(config, f"documents?boardId={board_id}") or []
+    board_docs = [d for d in existing if d.get("boardId") == board_id]
+    existing_index = build_existing_card_index(board_docs, state)
+    used_existing_ids = set()
 
     classified = []
     for task in tasks:
@@ -885,7 +950,24 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
 
     classified.sort(key=lambda x: -x[2])
 
-    needed_columns = set(c for _, c, _ in classified) | permanent
+    matched_cards = {}
+    for task, _, _ in classified:
+        doc = find_existing_card(task, existing_index, used_existing_ids)
+        if doc:
+            matched_cards[id(task)] = doc
+
+    preserved_statuses = {
+        doc.get("status")
+        for doc in matched_cards.values()
+        if doc.get("status")
+    }
+    preserved_statuses.update(
+        doc.get("status")
+        for doc in board_docs
+        if doc.get("_id") in protected and doc.get("status")
+    )
+
+    needed_columns = set(c for _, c, _ in classified) | permanent | preserved_statuses
     active_columns = []
     for key in sorted(needed_columns, key=lambda k: all_columns.get(k, {}).get("order", 99)):
         meta = all_columns.get(key, {"title": key.replace("-", " ").title(), "order": 99})
@@ -903,25 +985,24 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
         col_names = [c["title"] for c in active_columns]
         print(f"  Columns: {' → '.join(col_names)}")
 
-    existing = wfs_request(config, f"documents?boardId={board_id}") or []
-    board_docs = [d for d in existing if d.get("boardId") == board_id]
-
     if not dry_run:
         deleted = 0
         preserved = 0
+        matched_ids = {doc.get("_id") for doc in matched_cards.values()}
         for doc in board_docs:
-            if doc["_id"] in protected:
+            if doc["_id"] in protected or doc["_id"] in matched_ids:
                 preserved += 1
             else:
                 wfs_request(config, f"documents/{doc['_id']}", method="DELETE")
                 deleted += 1
-        msg = f"  Cleared {deleted} existing cards"
+        msg = f"  Removed {deleted} stale cards"
         if preserved:
-            msg += f" (preserved {preserved} WFS-only)"
+            msg += f" (preserved {preserved} existing)"
         print(msg)
 
     columns_order = [c["key"] for c in active_columns]
     created = 0
+    updated = 0
     card_state = {}
 
     for col_key in columns_order:
@@ -937,25 +1018,39 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
                 "type": "document",
                 "boardId": board_id,
             }
+            existing_doc = matched_cards.get(id(task))
 
             if dry_run:
                 role = "assigned" if task["is_assigned"] else "mentioned"
-                print(f"  [{col_key:12s}] (p={priority:3d}) [{role:8s}] {task['title']}")
+                action = "update" if existing_doc else "create"
+                current_status = existing_doc.get("status", col_key) if existing_doc else col_key
+                print(f"  [{current_status:12s}] (p={priority:3d}) [{role:8s}] {action}: {task['title']}")
             else:
-                result = wfs_request(config, "documents", method="POST", data=card)
+                if existing_doc:
+                    result = wfs_request(config, f"documents/{existing_doc['_id']}", method="PATCH", data={
+                        "title": task["title"],
+                        "text": card_html,
+                        "type": "document",
+                    })
+                else:
+                    result = wfs_request(config, "documents", method="POST", data=card)
+
                 if result:
-                    created += 1
+                    if existing_doc:
+                        updated += 1
+                    else:
+                        created += 1
                     card_state[result["_id"]] = {
                         "title": task["title"],
                         "confluence_title": task["title_full"].split("\n")[0].strip(),
                         "text": card_html,
-                        "status": col_key,
+                        "status": result.get("status", existing_doc.get("status", col_key) if existing_doc else col_key),
                         "row_local_id": task.get("row_local_id", ""),
                         "section": task.get("section", ""),
                     }
 
     if not dry_run:
-        print(f"  Created {created} cards across {len(columns_order)} columns")
+        print(f"  Updated {updated} cards, created {created} cards across {len(columns_order)} columns")
 
     return classified, card_state
 
