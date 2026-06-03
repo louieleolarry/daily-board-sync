@@ -52,10 +52,18 @@ def save_state(state):
 
 
 def load_credentials(config):
-    creds_path = Path(config["confluence"]["credentials_source"]).expanduser()
-    with open(creds_path) as f:
-        jira_config = json.load(f)
-    return jira_config["jira"]["email"], jira_config["jira"]["token"]
+    creds = config.get("credentials", {})
+    if creds.get("email") and creds.get("token"):
+        return creds["email"], creds["token"]
+    creds_source = config.get("confluence", {}).get("credentials_source", "")
+    if creds_source:
+        creds_path = Path(creds_source).expanduser()
+        if creds_path.exists():
+            with open(creds_path) as f:
+                jira_config = json.load(f)
+            return jira_config["jira"]["email"], jira_config["jira"]["token"]
+    print("  ERROR: No credentials found. Run: python3 sync.py --setup", file=sys.stderr)
+    sys.exit(1)
 
 
 def api_request(url, method="GET", data=None, auth=None, extra_headers=None):
@@ -942,11 +950,26 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
     existing_index = build_existing_card_index(board_docs, state)
     used_existing_ids = set()
 
+    state = load_state()
+    saved_status_by_title = {}
+    for card_info in state.get("cards", {}).values():
+        if card_info.get("title") and card_info.get("status"):
+            saved_status_by_title[card_info["title"]] = card_info["status"]
+
     classified = []
+    preserved_count = 0
     for task in tasks:
-        col = classify_status(task, config)
+        saved_col = saved_status_by_title.get(task["title"])
+        if saved_col and saved_col in all_columns:
+            col = saved_col
+            preserved_count += 1
+        else:
+            col = classify_status(task, config)
         priority = compute_priority_score(task, config)
         classified.append((task, col, priority))
+
+    if preserved_count:
+        print(f"  Preserved WFS column for {preserved_count} existing task(s)")
 
     classified.sort(key=lambda x: -x[2])
 
