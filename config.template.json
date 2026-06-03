@@ -8,6 +8,7 @@
   },
   "board": {
     "api_base": "https://workflowshortcuts.com/api",
+    "api_token_env": "WFS_BOT_TOKEN",
     "board_id": "__BOARD_ID__",
     "permanent_columns": ["todo", "in-progress", "done"],
     "all_columns": {

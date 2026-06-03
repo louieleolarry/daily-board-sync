@@ -58,8 +58,10 @@ def load_credentials(config):
     return jira_config["jira"]["email"], jira_config["jira"]["token"]
 
 
-def api_request(url, method="GET", data=None, auth=None):
+def api_request(url, method="GET", data=None, auth=None, extra_headers=None):
     headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
     if auth:
         email, token = auth
         cred = b64encode(f"{email}:{token}".encode()).decode()
@@ -77,6 +79,42 @@ def api_request(url, method="GET", data=None, auth=None):
         body = e.read().decode()
         print(f"  {body[:200]}", file=sys.stderr)
         return None
+
+
+def get_wfs_token(config):
+    board_config = config.get("board", {})
+    token = str(board_config.get("api_token") or "").strip()
+
+    if token:
+        return token
+
+    env_names = [
+        board_config.get("api_token_env"),
+        "WFS_BOT_TOKEN",
+        "WFS_API_TOKEN",
+        "BOT_API_TOKEN",
+    ]
+
+    for env_name in env_names:
+        if not env_name:
+            continue
+        token = os.environ.get(str(env_name), "").strip()
+        if token:
+            return token
+
+    return ""
+
+
+def wfs_request(config, path, method="GET", data=None):
+    api_base = config["board"]["api_base"].rstrip("/")
+    url = path if path.startswith("http") else f"{api_base}/{path.lstrip('/')}"
+    token = get_wfs_token(config)
+    headers = {}
+
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    return api_request(url, method=method, data=data, extra_headers=headers)
 
 
 def get_current_week_start(override_date=None, start_day="monday"):
@@ -834,7 +872,6 @@ def build_card_html(task):
 def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
     """Clear board and repopulate with triaged tasks. Returns card state for saving."""
     board_id = config["board"]["board_id"]
-    api_base = config["board"]["api_base"]
     today = datetime.now().strftime("%Y-%m-%d")
     all_columns = config["board"]["all_columns"]
     permanent = set(config["board"]["permanent_columns"])
@@ -855,8 +892,7 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
         active_columns.append({"key": key, "title": meta["title"]})
 
     if not dry_run:
-        board_url = f"{api_base}/boards/{board_id}"
-        api_request(board_url, method="PATCH", data={
+        wfs_request(config, f"boards/{board_id}", method="PATCH", data={
             "title": f"BWeldy Daily — {today}",
             "columns": active_columns,
         })
@@ -867,8 +903,7 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
         col_names = [c["title"] for c in active_columns]
         print(f"  Columns: {' → '.join(col_names)}")
 
-    docs_url = f"{api_base}/documents?boardId={board_id}"
-    existing = api_request(docs_url) or []
+    existing = wfs_request(config, f"documents?boardId={board_id}") or []
     board_docs = [d for d in existing if d.get("boardId") == board_id]
 
     if not dry_run:
@@ -878,7 +913,7 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
             if doc["_id"] in protected:
                 preserved += 1
             else:
-                api_request(f"{api_base}/documents/{doc['_id']}", method="DELETE")
+                wfs_request(config, f"documents/{doc['_id']}", method="DELETE")
                 deleted += 1
         msg = f"  Cleared {deleted} existing cards"
         if preserved:
@@ -907,7 +942,7 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
                 role = "assigned" if task["is_assigned"] else "mentioned"
                 print(f"  [{col_key:12s}] (p={priority:3d}) [{role:8s}] {task['title']}")
             else:
-                result = api_request(f"{api_base}/documents", method="POST", data=card)
+                result = wfs_request(config, "documents", method="POST", data=card)
                 if result:
                     created += 1
                     card_state[result["_id"]] = {
@@ -960,9 +995,7 @@ def main():
         print("  Checking WFS board for edits to push back...")
         state = load_state()
         board_id = config["board"]["board_id"]
-        api_base = config["board"]["api_base"]
-        docs_url = f"{api_base}/documents?boardId={board_id}"
-        current_cards = api_request(docs_url) or []
+        current_cards = wfs_request(config, f"documents?boardId={board_id}") or []
         board_cards = [d for d in current_cards if d.get("boardId") == board_id]
 
         pushed = push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=args.dry_run)

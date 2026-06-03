@@ -69,3 +69,18 @@ python3 sync.py --setup        # Re-run setup wizard
 - macOS (for launchd cron; Linux users can use crontab directly)
 - Atlassian API token (free, generated during setup)
 - WorkflowShortcuts account (boards are created automatically)
+- WorkflowShortcuts bot API key for board writes
+
+## WorkflowShortcuts Auth
+
+Set your WorkflowShortcuts bot key before running sync:
+
+```bash
+export WFS_BOT_TOKEN="wfs_bot_..."
+python3 sync.py
+```
+
+Alternatively, set `"api_token_env": "YOUR_ENV_VAR_NAME"` under `board` in
+`config.json`, or set `"api_token"` directly for local-only installs. The sync
+sends the key as `Authorization: Bearer <token>` for board PATCH and card
+create/delete requests.
