@@ -208,44 +208,65 @@ def strip_html_tags(html_str):
     return text.strip()
 
 
-def extract_new_content(current_text, synced_text):
-    """Find content added to a WFS card since last sync.
+METADATA_PREFIXES = (
+    "Project:", "Refs:", "Status:", "Latest:", "Role:",
+    "<b>Project:</b>", "<b>Refs:</b>", "<b>Status:</b>",
+    "<b>Latest:</b>", "<b>Role:</b>",
+)
 
-    Compares plain-text versions for diff detection but returns
-    original HTML lines to preserve formatting (bold, links, etc).
+
+def split_html_lines(html):
+    """Split HTML into lines, preserving tags."""
+    lines = re.split(r'<br\s*/?>', html)
+    lines = [re.sub(r'</?(div|p)[^>]*>', '', l).strip() for l in lines]
+    return [l for l in lines if l]
+
+
+def is_metadata_line(line):
+    """Check if a line is auto-generated card metadata (not user content)."""
+    plain = strip_html_tags(line).strip()
+    if not plain:
+        return True
+    for prefix in METADATA_PREFIXES:
+        if plain.startswith(strip_html_tags(prefix)):
+            return True
+    return False
+
+
+def extract_user_notes(card_text):
+    """Extract only user-added lines from a WFS card, stripping metadata."""
+    lines = split_html_lines(card_text)
+    return [l for l in lines if not is_metadata_line(l)]
+
+
+def normalize_line(line):
+    s = strip_html_tags(line)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s.rstrip('-').strip()
+
+
+def extract_new_user_content(card_text, confluence_status_text):
+    """Find user-added WFS content that isn't already in Confluence.
+
+    Returns only genuinely new lines — not metadata, not duplicates
+    of existing Confluence content.
     """
-    current_plain = strip_html_tags(current_text).strip()
-    synced_plain = strip_html_tags(synced_text).strip()
-
-    if current_plain == synced_plain:
+    user_notes = extract_user_notes(card_text)
+    if not user_notes:
         return []
 
-    def split_html_lines(html):
-        """Split HTML into lines, preserving tags."""
-        lines = re.split(r'<br\s*/?>', html)
-        lines = [re.sub(r'</?(div|p)[^>]*>', '', l).strip() for l in lines]
-        return [l for l in lines if l]
-
-    current_html_lines = split_html_lines(current_text)
-    current_plain_lines = [strip_html_tags(l).strip() for l in current_html_lines]
-
-    if current_plain.startswith(synced_plain):
-        synced_line_count = len([l for l in strip_html_tags(synced_text).strip().split("\n") if l.strip()])
-        new_html = current_html_lines[synced_line_count:]
-        return [l for l in new_html if strip_html_tags(l).strip()]
-
-    def normalize(line):
-        s = re.sub(r'\s+', ' ', line).strip()
-        return s.rstrip('-').strip()
-
-    synced_lines = [l.strip() for l in synced_plain.split("\n") if l.strip()]
-    synced_normalized = {normalize(l) for l in synced_lines}
+    confluence_plain = strip_html_tags(confluence_status_text).strip()
+    confluence_normalized = set()
+    for line in confluence_plain.split("\n"):
+        norm = normalize_line(line)
+        if norm:
+            confluence_normalized.add(norm)
 
     new_lines = []
     seen = set()
-    for html_line, plain_line in zip(current_html_lines, current_plain_lines):
-        norm = normalize(plain_line)
-        if norm and norm not in synced_normalized and norm not in seen:
+    for html_line in user_notes:
+        norm = normalize_line(html_line)
+        if norm and norm not in confluence_normalized and norm not in seen:
             new_lines.append(html_line)
             seen.add(norm)
 
@@ -525,7 +546,8 @@ def push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=F
         if user_edited_ids is not None and card_id not in user_edited_ids:
             continue
 
-        new_lines = extract_new_content(card_text, saved.get("text", ""))
+        confluence_status = saved.get("confluence_status_text", saved.get("text", ""))
+        new_lines = extract_new_user_content(card_text, confluence_status)
         if new_lines:
             updates.append({
                 "title": card_title,
@@ -1108,9 +1130,14 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
                 print(f"  [{current_status:12s}] (p={priority:3d}) [{role:8s}] {action}: {task['title']}")
             else:
                 if existing_doc:
+                    existing_text = existing_doc.get("text", "")
+                    user_notes = extract_user_notes(existing_text)
+                    final_html = card_html
+                    if user_notes:
+                        final_html += "<br><br>" + "<br>".join(user_notes)
                     result = wfs_request(config, f"documents/{existing_doc['_id']}", method="PATCH", data={
                         "title": task["title"],
-                        "text": card_html,
+                        "text": final_html,
                         "type": "document",
                         **source_fields,
                     })
@@ -1125,6 +1152,7 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
                         "title": task["title"],
                         "confluence_title": task["title_full"].split("\n")[0].strip(),
                         "text": card_html,
+                        "confluence_status_text": task.get("status_text", ""),
                         "status": result.get("status", existing_doc.get("status", col_key) if existing_doc else col_key),
                         "row_local_id": task.get("row_local_id", ""),
                         "section": task.get("section", ""),
