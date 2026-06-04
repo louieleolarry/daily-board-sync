@@ -1,86 +1,220 @@
 # Daily Board Sync
 
-Bi-directional sync between your Confluence weekly standup page and a personal WorkflowShortcuts kanban board. Auto-triages tasks, stack-ranks by priority, and syncs edits both ways.
+Bi-directional sync between Codazen's Confluence weekly standup page and personal [WorkflowShortcuts](https://workflowshortcuts.com) kanban boards. Auto-triages tasks, stack-ranks by priority, and syncs edits both ways.
 
-## Quick Start
+Syncs trigger automatically via Cloudflare Worker webhook relay — no local machine or cron needed.
 
-```bash
-# 1. Copy this folder to your machine
-cp -r daily-board-sync-dist ~/.claude/skills/daily-board-sync
+---
 
-# 2. Run the setup wizard
-python3 ~/.claude/skills/daily-board-sync/sync.py --setup
+## For Codazen Team Members
 
-# 3. Run your first sync
-python3 ~/.claude/skills/daily-board-sync/sync.py
+**Brad has already configured the sync infrastructure.** To get started:
+
+1. Go to [workflowshortcuts.com](https://workflowshortcuts.com)
+2. Sign in with Google using your **Codazen email** (`@codazen.com`)
+3. Your personal daily board is already created and syncing automatically
+
+Your board pulls tasks from the shared Confluence weekly standup page and keeps them in sync. Move cards between columns on your board — those changes persist across syncs.
+
+| Team Member | Board |
+|---|---|
+| Brad Weldy | [BWeldy Daily](https://workflowshortcuts.com/?boardId=6a15e10131d15ceb8d412054) |
+| Sumana Thaduri | [SUThaduri Daily](https://workflowshortcuts.com/?boardId=6a21c7dfb61e1c042ef80739) |
+| Jesse Burgess | [JBurgess Daily](https://workflowshortcuts.com/?boardId=6a21cbb5b61e1c042ef80771) |
+| Rayan Tighiouart | [RTighiouart Daily](https://workflowshortcuts.com/?boardId=6a21cbb5b61e1c042ef80773) |
+| Mario Melchor | [MMelchor Daily](https://workflowshortcuts.com/?boardId=6a21cbb5b61e1c042ef80775) |
+
+---
+
+## How It Works
+
+### Sync Flow
+
+```
+Confluence Standup Page
+        ↓ parse tasks per user
+    sync.py --user all
+        ↓ triage + stack-rank
+WorkflowShortcuts Boards
+        ↓ card moved/edited by user
+    WFS Webhook
+        ↓
+    Cloudflare Worker Relay
+        ↓
+    GitHub Actions (repository_dispatch)
+        ↓
+    sync.py --auto --user all
+        ↓ push edits back
+Confluence Standup Page
 ```
 
-The setup wizard will:
-- Open the Atlassian API token page in your browser
-- Validate your credentials
-- Auto-detect your account ID and display name
-- Create a personal WorkflowShortcuts board
-- Write your `config.json`
-- Optionally set up a weekday 6AM cron via macOS launchd
+### What Each Sync Does
 
-## What It Does
+1. **WFS → Confluence:** If you edited a card (added notes, moved columns), changes are pushed back to the matching Confluence row.
 
-**Every sync runs two phases:**
+2. **Confluence → WFS:** Fetches your tasks from the weekly standup, auto-triages into columns, stack-ranks by priority, and updates your board.
 
-1. **WFS → Confluence:** If you edited a card on your board (added notes, status updates), those additions get pushed back to the matching row in Confluence.
+### Dynamic Columns
 
-2. **Confluence → WFS:** Fetches your tasks from the weekly standup page, auto-triages into dynamic columns, stack-ranks by priority, and refreshes your board.
-
-**Dynamic columns** — only appear when tasks need them:
+Only appear when tasks need them:
 
 | Column | Trigger Keywords |
-|--------|-----------------|
+|---|---|
 | Todo | (default) |
 | In Progress | "working on", "target EOD", "investigating today" |
-| In Review | "awaiting review", "submitted for", "to review", "LGTM" |
+| In Review | "awaiting review", "submitted for", "LGTM" |
 | Blocked | "waiting on", "blocked", "still investigating" |
 | On Hold | "on hold", "on pause", "low priority" |
 | Needs Input | "approval request", "decision needed" |
 | Done | "landed", "completed", "live", "closed" |
 
-## Usage
+### Source Tracking
+
+Cards are tagged with `sourceSystem: "confluence"` and `sourceResourceId` (the Confluence row ID). This means:
+- Renaming a task in Confluence won't orphan its WFS card
+- Matching is reliable even if titles change
+- Cards link back to their Confluence source
+
+---
+
+## Architecture
+
+### Auto-Sync (Production)
+
+Triggered automatically when any user moves a card on their WFS board:
+
+```
+WFS Board Change → WFS Webhook POST → Cloudflare Worker → GitHub Actions → sync.py
+```
+
+| Component | Location | Purpose |
+|---|---|---|
+| `sync.py` | This repo | Main sync script |
+| Cloudflare Worker | `worker/index.js` | Webhook relay — receives WFS events, triggers GitHub Actions |
+| GitHub Actions | `.github/workflows/auto-sync.yml` | Runs sync on dispatch |
+| WFS Subscriptions | WFS API | One webhook per board, pointing at the Worker URL |
+
+**Worker URL:** `https://wfs-sync-relay.workflowshortcuts.workers.dev`
+
+### Manual Sync (Local)
+
+Still available for development and debugging:
 
 ```bash
-python3 sync.py                # Full bi-directional sync
-python3 sync.py --dry-run -v   # Preview without writing
-python3 sync.py --push-only    # Only push board edits to Confluence
-python3 sync.py --pull-only    # Only pull Confluence to board
-python3 sync.py --setup        # Re-run setup wizard
+python3 sync.py                        # Sync default user (bweldy)
+python3 sync.py --user all             # Sync all users
+python3 sync.py --user suthaduri       # Sync specific user
+python3 sync.py --auto --user all      # Skip unchanged boards (event-based)
+python3 sync.py --dry-run -v           # Preview without writing
+python3 sync.py --push-only            # Only push board edits to Confluence
+python3 sync.py --pull-only            # Only pull Confluence to board
+python3 sync.py --daemon 10            # Run continuously every 10 minutes
 ```
+
+---
+
+## Configuration (for admins)
+
+### Adding a New Team Member
+
+1. Look up their Atlassian account ID:
+   ```bash
+   curl -s -u email:token \
+     https://codazen.atlassian.net/rest/api/3/user/search?query=firstname
+   ```
+
+2. Create their WFS board via the bot API:
+   ```bash
+   curl -X POST https://workflowshortcuts.com/api/bot/actions \
+     -H 'X-Bot-Token: <token>' \
+     -H 'Content-Type: application/json' \
+     -d '{"action":"create","resource":"boards","payload":{
+       "title":"FLast Daily",
+       "columns":[
+         {"key":"todo","title":"Todo"},
+         {"key":"in-progress","title":"In Progress"},
+         {"key":"in-review","title":"In Review"},
+         {"key":"blocked","title":"Blocked"},
+         {"key":"done","title":"Done"}
+       ]}}'
+   ```
+
+3. Add them to `config.json` under `users`:
+   ```json
+   "username": {
+     "atlassian_account_id": "<account_id>",
+     "display_name": "First Last",
+     "board_id": "<board_id_from_step_2>",
+     "board_title_prefix": "FLast Daily",
+     "match_name": "first"
+   }
+   ```
+
+4. Add a WFS webhook subscription for their board:
+   ```bash
+   curl -X POST https://workflowshortcuts.com/api/bot/subscriptions \
+     -H 'X-Bot-Token: <token>' \
+     -H 'Content-Type: application/json' \
+     -d '{"boardId":"<board_id>",
+       "targetUrl":"https://wfs-sync-relay.workflowshortcuts.workers.dev",
+       "eventTypes":["card.updated","card.created","card.deleted"]}'
+   ```
+
+5. Run initial sync: `python3 sync.py --user <username>`
+
+### Cloudflare Worker Setup
+
+The webhook relay is already deployed at `wfs-sync-relay.workflowshortcuts.workers.dev`. To redeploy or modify:
+
+```bash
+cd worker
+npx wrangler login                    # One-time Cloudflare auth
+npx wrangler deploy                   # Deploy worker
+npx wrangler secret put GITHUB_PAT    # Set GitHub PAT (needs repo Actions write scope)
+```
+
+The worker filters out bot-originated events to prevent infinite sync loops.
+
+### GitHub Actions Secrets
+
+Set in repo **Settings → Secrets and variables → Actions**:
+
+| Secret | Purpose |
+|---|---|
+| `CONFLUENCE_EMAIL` | Atlassian account email |
+| `CONFLUENCE_TOKEN` | Atlassian API token |
+| `WFS_BOT_TOKEN` | WorkflowShortcuts bot API key |
+
+### Re-enabling Cron Polling (fallback)
+
+If the webhook relay goes down, uncomment the `schedule` block in `.github/workflows/auto-sync.yml`:
+
+```yaml
+schedule:
+  - cron: '*/10 13-23 * * 1-5'
+  - cron: '*/10 0-3 * * 2-6'
+```
+
+This runs sync every 10 minutes during weekday work hours (6am-8pm PT).
+
+---
 
 ## Files
 
 | File | Purpose |
-|------|---------|
-| `sync.py` | Main script (sync + setup wizard) |
-| `config.template.json` | Template with placeholders (do not edit) |
-| `config.json` | Your personal config (created by setup) |
-| `last_sync_state.json` | Card snapshot for diff detection (auto-managed) |
-| `sync.log` | Cron output log |
+|---|---|
+| `sync.py` | Main sync script — multi-user, bi-directional |
+| `config.template.json` | Config template with placeholders (committed) |
+| `config.json` | Local config with secrets (gitignored) |
+| `last_sync_state*.json` | Per-user card snapshots (gitignored) |
+| `worker/index.js` | Cloudflare Worker relay source |
+| `worker/wrangler.toml` | Worker deployment config |
+| `.github/workflows/auto-sync.yml` | GitHub Actions workflow |
 
 ## Requirements
 
 - Python 3.8+
-- macOS (for launchd cron; Linux users can use crontab directly)
-- Atlassian API token (free, generated during setup)
-- WorkflowShortcuts account (boards are created automatically)
-- WorkflowShortcuts bot API key for board writes
-
-## WorkflowShortcuts Auth
-
-Set your WorkflowShortcuts bot key before running sync:
-
-```bash
-export WFS_BOT_TOKEN="wfs_bot_..."
-python3 sync.py
-```
-
-Alternatively, set `"api_token_env": "YOUR_ENV_VAR_NAME"` under `board` in
-`config.json`, or set `"api_token"` directly for local-only installs. The sync
-sends the key as `Authorization: Bearer <token>` for board PATCH and card
-create/delete requests.
+- Atlassian API token
+- WorkflowShortcuts account + bot API key
+- Cloudflare account (for webhook relay)
+- GitHub Actions (for automated sync)
