@@ -3,10 +3,11 @@ name: Auto Sync Boards
 on:
   repository_dispatch:
     types: [wfs-board-change]
-  schedule:
-    # Every 10 minutes, weekdays only (Mon-Fri, 6am-8pm PT / 13:00-03:00 UTC)
-    - cron: '*/10 13-23 * * 1-5'
-    - cron: '*/10 0-3 * * 2-6'
+  # DEPRECATED: Polling kept as safety net — webhook relay handles real-time sync.
+  # To re-enable polling, uncomment the schedule block below.
+  # schedule:
+  #   - cron: '*/10 13-23 * * 1-5'
+  #   - cron: '*/10 0-3 * * 2-6'
   workflow_dispatch:
     inputs:
       user:
