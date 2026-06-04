@@ -4,5 +4,15 @@ compatibility_date = "2024-01-01"
 
 [vars]
 GITHUB_REPO = "louieleolarry/daily-board-sync"
+DEBOUNCE_SECONDS = "60"
 
 # GITHUB_PAT is set as a secret via: wrangler secret put GITHUB_PAT
+
+# KV namespace for debounce state
+[[kv_namespaces]]
+binding = "SYNC_STATE"
+id = "a30943d5c0244c998145ba8f2abac6a5"
+
+# Check for pending dispatches every minute
+[triggers]
+crons = ["* * * * *"]
