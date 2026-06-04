@@ -211,8 +211,8 @@ def strip_html_tags(html_str):
 def extract_new_content(current_text, synced_text):
     """Find content added to a WFS card since last sync.
 
-    Compares plain-text versions of current card vs what we generated.
-    Returns list of new lines added at the end.
+    Compares plain-text versions for diff detection but returns
+    original HTML lines to preserve formatting (bold, links, etc).
     """
     current_plain = strip_html_tags(current_text).strip()
     synced_plain = strip_html_tags(synced_text).strip()
@@ -220,25 +220,33 @@ def extract_new_content(current_text, synced_text):
     if current_plain == synced_plain:
         return []
 
+    def split_html_lines(html):
+        """Split HTML into lines, preserving tags."""
+        lines = re.split(r'<br\s*/?>', html)
+        lines = [re.sub(r'</?(div|p)[^>]*>', '', l).strip() for l in lines]
+        return [l for l in lines if l]
+
+    current_html_lines = split_html_lines(current_text)
+    current_plain_lines = [strip_html_tags(l).strip() for l in current_html_lines]
+
     if current_plain.startswith(synced_plain):
-        new_part = current_plain[len(synced_plain):].strip()
-        if new_part:
-            return [line.strip() for line in new_part.split("\n") if line.strip()]
+        synced_line_count = len([l for l in strip_html_tags(synced_text).strip().split("\n") if l.strip()])
+        new_html = current_html_lines[synced_line_count:]
+        return [l for l in new_html if strip_html_tags(l).strip()]
 
     def normalize(line):
         s = re.sub(r'\s+', ' ', line).strip()
         return s.rstrip('-').strip()
 
-    current_lines = [l.strip() for l in current_plain.split("\n") if l.strip()]
     synced_lines = [l.strip() for l in synced_plain.split("\n") if l.strip()]
     synced_normalized = {normalize(l) for l in synced_lines}
 
     new_lines = []
     seen = set()
-    for line in current_lines:
-        norm = normalize(line)
+    for html_line, plain_line in zip(current_html_lines, current_plain_lines):
+        norm = normalize(plain_line)
         if norm and norm not in synced_normalized and norm not in seen:
-            new_lines.append(line)
+            new_lines.append(html_line)
             seen.add(norm)
 
     return new_lines
@@ -717,6 +725,7 @@ class ConfluenceTaskParser(HTMLParser):
                         "title": self._extract_title(self._row_data["title_text"]),
                         "title_full": self._row_data["title_text"],
                         "status_text": self._row_data["status_text"],
+                        "status_html": self._row_data["status_html"],
                         "section": self.current_section,
                         "highlight_color": self._highlight_color,
                         "row_local_id": self._row_local_id,
@@ -859,18 +868,32 @@ def build_card_html(task):
 
     parts.append("")
 
-    status_lines = task["status_text"].strip()
-    date_sections = re.split(r'(?=\d{4}-\d{2}-\d{2})', status_lines)
-    if len(date_sections) > 1:
-        latest = date_sections[-1].strip()
-        latest = re.sub(r'^\d{4}-\d{2}-\d{2}\s*', '', latest).strip()
-        if latest:
-            parts.append(f"<b>Latest:</b> {latest.replace(chr(10), '<br>')}")
-    elif status_lines:
-        cleaned = re.sub(r'\d{4}-\d{2}-\d{2}\s*', '', status_lines).strip()
-        cleaned = re.sub(r'\n-+\n', '\n', cleaned)
-        if cleaned:
-            parts.append(f"<b>Status:</b> {cleaned.replace(chr(10), '<br>')}")
+    status_html = task.get("status_html", "").strip()
+    status_text = task["status_text"].strip()
+
+    if status_html:
+        date_sections = re.split(r'(?=<time>?\d{4}-\d{2}-\d{2})', status_html)
+        if len(date_sections) > 1:
+            latest = date_sections[-1].strip()
+            latest = re.sub(r'^<time>?\d{4}-\d{2}-\d{2}</time>?\s*', '', latest).strip()
+            if latest:
+                parts.append(f"<b>Latest:</b> {latest}")
+        elif status_html:
+            cleaned = re.sub(r'<time>\d{4}-\d{2}-\d{2}</time>\s*', '', status_html).strip()
+            if cleaned:
+                parts.append(f"<b>Status:</b> {cleaned}")
+    elif status_text:
+        date_sections = re.split(r'(?=\d{4}-\d{2}-\d{2})', status_text)
+        if len(date_sections) > 1:
+            latest = date_sections[-1].strip()
+            latest = re.sub(r'^\d{4}-\d{2}-\d{2}\s*', '', latest).strip()
+            if latest:
+                parts.append(f"<b>Latest:</b> {latest.replace(chr(10), '<br>')}")
+        else:
+            cleaned = re.sub(r'\d{4}-\d{2}-\d{2}\s*', '', status_text).strip()
+            cleaned = re.sub(r'\n-+\n', '\n', cleaned)
+            if cleaned:
+                parts.append(f"<b>Status:</b> {cleaned.replace(chr(10), '<br>')}")
 
     return "<div>" + "</div><div>".join(parts) + "</div>"
 
