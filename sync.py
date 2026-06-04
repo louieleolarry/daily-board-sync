@@ -34,6 +34,12 @@ CONFIG_PATH = SCRIPT_DIR / "config.json"
 STATE_PATH = SCRIPT_DIR / "last_sync_state.json"
 
 
+def state_path_for_user(user_key):
+    if not user_key or user_key == "bweldy":
+        return STATE_PATH
+    return SCRIPT_DIR / f"last_sync_state_{user_key}.json"
+
+
 def load_config():
     with open(CONFIG_PATH) as f:
         return json.load(f)
@@ -589,9 +595,10 @@ def push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=F
 class ConfluenceTaskParser(HTMLParser):
     """Parse Confluence storage format HTML to extract task rows from tables."""
 
-    def __init__(self, target_account_id):
+    def __init__(self, target_account_id, match_name=None):
         super().__init__()
         self.target_id = target_account_id
+        self.match_name = (match_name or "").lower()
         self.tasks = []
         self.current_section = ""
 
@@ -708,7 +715,7 @@ class ConfluenceTaskParser(HTMLParser):
         if tag == "tr" and self._in_table:
             self._in_row = False
             if not self._is_header_row and self._row_data["title_text"].strip():
-                target_name_lower = "brad"
+                target_name_lower = self.match_name
                 status_lower = self._row_data["status_text"].lower()
                 title_lower = self._row_data["title_text"].lower()
                 if target_name_lower in status_lower or target_name_lower in title_lower:
@@ -1092,6 +1099,111 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
     return classified, card_state
 
 
+TOP_LEVEL_SECTIONS = [
+    "Family Center", "Workplace Deprecation", "AI for Good",
+    "AI", "MDC", "Engineering Services R&D"
+]
+
+
+def find_section_ranges(html, sections):
+    ranges = []
+    for section in sections:
+        pattern = f'<ac:parameter ac:name="title">{re.escape(section)}</ac:parameter>'
+        match = re.search(pattern, html)
+        if match:
+            ranges.append((match.start(), section))
+    ranges.sort()
+    result = []
+    for i, (pos, name) in enumerate(ranges):
+        end = ranges[i + 1][0] if i + 1 < len(ranges) else len(html)
+        result.append((name, html[pos:end]))
+    return result
+
+
+def sync_user(user_key, user_cfg, config, auth, page, html_content, week_date, args):
+    """Run the full sync for a single user."""
+    account_id = user_cfg["atlassian_account_id"]
+    display_name = user_cfg["display_name"]
+    board_id = user_cfg["board_id"]
+    board_prefix = user_cfg.get("board_title_prefix", display_name)
+    match_name = user_cfg.get("match_name", display_name.split()[0].lower())
+
+    # Override config for this user
+    user_config = json.loads(json.dumps(config))
+    user_config["board"]["board_id"] = board_id
+    user_config["user"]["atlassian_account_id"] = account_id
+    user_config["user"]["display_name"] = display_name
+
+    print(f"\n  === {display_name} ({user_key}) ===")
+
+    sp = state_path_for_user(user_key)
+
+    # --- Reverse sync (WFS → Confluence) ---
+    pending_new_card_ids = []
+    if not args.pull_only:
+        state = {}
+        if sp.exists():
+            with open(sp) as f:
+                state = json.load(f)
+
+        current_cards = wfs_request(user_config, f"documents?boardId={board_id}") or []
+        board_cards = [d for d in current_cards if d.get("boardId") == board_id]
+
+        pushed = push_updates_to_confluence(user_config, auth, page, board_cards, state, dry_run=args.dry_run)
+        if pushed and not args.dry_run:
+            page = find_weekly_page(user_config, auth, week_date)
+            html_content = page["body"]["storage"]["value"]
+
+    if args.push_only:
+        return page, html_content
+
+    # --- Forward sync (Confluence → WFS) ---
+    all_tasks = []
+    for section_name, section_html in find_section_ranges(html_content, TOP_LEVEL_SECTIONS):
+        task_parser = ConfluenceTaskParser(account_id, match_name=match_name)
+        task_parser.current_section = section_name
+        task_parser.feed(section_html)
+        for t in task_parser.tasks:
+            t["section"] = section_name
+        all_tasks.extend(task_parser.tasks)
+
+    exclude = config.get("exclude_tasks", [])
+    if exclude:
+        all_tasks = [t for t in all_tasks if t["title"] not in exclude]
+    print(f"  Found {len(all_tasks)} tasks for {display_name}")
+
+    if args.verbose:
+        for t in all_tasks:
+            role = "ASSIGNED" if t["is_assigned"] else "MENTIONED"
+            print(f"    [{role:8s}] [{t['section']:20s}] {t['title']}")
+
+    print("  Triaging and syncing board...")
+
+    # Update board title with today's date
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not args.dry_run:
+        wfs_request(user_config, f"boards/{board_id}", method="PATCH", data={
+            "title": f"{board_prefix} — {today}",
+        })
+
+    classified, card_state = sync_board(all_tasks, user_config, dry_run=args.dry_run, protected_card_ids=pending_new_card_ids)
+
+    if not args.dry_run and card_state:
+        with open(sp, "w") as f:
+            json.dump({
+                "synced_at": datetime.now().isoformat(),
+                "week_date": week_date,
+                "cards": card_state,
+            }, f, indent=2)
+
+    summary = {}
+    for _, col, _ in classified:
+        summary[col] = summary.get(col, 0) + 1
+    print(f"  Board: {' | '.join(f'{k}={v}' for k, v in summary.items())}")
+
+    return page, html_content
+
+
 def main():
     parser = argparse.ArgumentParser(description="Bi-directional sync: Confluence ↔ WorkflowShortcuts board")
     parser.add_argument("--dry-run", action="store_true", help="Preview without writing")
@@ -1101,6 +1213,7 @@ def main():
     parser.add_argument("--pull-only", action="store_true", help="Only pull Confluence to WFS")
     parser.add_argument("--approve-new", action="store_true", help="Insert new WFS-only cards into Confluence")
     parser.add_argument("--section", help="Confluence section for new tasks (e.g. 'AI', 'Family Center')")
+    parser.add_argument("--user", default=None, help="Sync specific user (key from config) or 'all'")
     args = parser.parse_args()
 
     config = load_config()
@@ -1121,134 +1234,29 @@ def main():
     html_content = page["body"]["storage"]["value"]
     print(f"  Page: {page['title']} (id={page['id']}, v{page['version']['number']})")
 
-    # --- Step 1: Reverse sync (WFS → Confluence) ---
-    pending_new_card_ids = []
-    if not args.pull_only:
-        print("  Checking WFS board for edits to push back...")
-        state = load_state()
-        board_id = config["board"]["board_id"]
-        current_cards = wfs_request(config, f"documents?boardId={board_id}") or []
-        board_cards = [d for d in current_cards if d.get("boardId") == board_id]
+    users_cfg = config.get("users", {})
 
-        pushed = push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=args.dry_run)
-        if pushed and not args.dry_run:
-            print("  Re-fetching Confluence page after push...")
-            page = find_weekly_page(config, auth, week_date)
-            html_content = page["body"]["storage"]["value"]
+    if args.user == "all" and users_cfg:
+        for user_key, user_cfg in users_cfg.items():
+            page, html_content = sync_user(user_key, user_cfg, config, auth, page, html_content, week_date, args)
+    elif args.user and args.user in users_cfg:
+        sync_user(args.user, users_cfg[args.user], config, auth, page, html_content, week_date, args)
+    elif users_cfg and not args.user:
+        # Default: sync the first user (bweldy)
+        default_key = next(iter(users_cfg))
+        sync_user(default_key, users_cfg[default_key], config, auth, page, html_content, week_date, args)
+    else:
+        # Legacy fallback: use top-level user config
+        user_cfg = {
+            "atlassian_account_id": config["user"]["atlassian_account_id"],
+            "display_name": config["user"]["display_name"],
+            "board_id": config["board"]["board_id"],
+            "board_title_prefix": "BWeldy Daily",
+            "match_name": "brad",
+        }
+        sync_user("bweldy", user_cfg, config, auth, page, html_content, week_date, args)
 
-        new_cards = detect_new_wfs_cards(board_cards, state)
-        if new_cards:
-            if args.approve_new:
-                section = args.section or config.get("board", {}).get("default_new_task_section", "AI")
-                print(f"  Inserting {len(new_cards)} new task(s) into Confluence section '{section}'...")
-                html = page["body"]["storage"]["value"]
-                version = page["version"]["number"]
-                user_id = config["user"]["atlassian_account_id"]
-                inserted = 0
-                for card in new_cards:
-                    status = strip_html_tags(card.get("text", "")).strip() or "Added from WFS board"
-                    result_html = insert_new_confluence_row(html, section, card["title"], status, user_id)
-                    if result_html:
-                        html = result_html
-                        inserted += 1
-                        print(f"    + {card['title']}")
-                    else:
-                        print(f"    WARN: Could not find section '{section}' for: {card['title']}", file=sys.stderr)
-
-                if inserted and not args.dry_run:
-                    base = config["confluence"]["base_url"]
-                    today = datetime.now().strftime("%Y-%m-%d")
-                    update_payload = {
-                        "id": page["id"],
-                        "type": "page",
-                        "title": page["title"],
-                        "body": {"storage": {"value": html, "representation": "storage"}},
-                        "version": {
-                            "number": version + 1,
-                            "message": f"daily-board-sync: added {inserted} new task(s) from WFS ({today})"
-                        }
-                    }
-                    result = api_request(
-                        f"{base}/wiki/rest/api/content/{page['id']}",
-                        method="PUT", data=update_payload, auth=auth
-                    )
-                    if result:
-                        print(f"  Confluence updated to version {result['version']['number']}")
-                        page = find_weekly_page(config, auth, week_date)
-                        html_content = page["body"]["storage"]["value"]
-                    else:
-                        print("  WARN: Confluence update failed", file=sys.stderr)
-            else:
-                print(f"  PENDING: {len(new_cards)} new WFS-only card(s) not in Confluence:")
-                for card in new_cards:
-                    text_preview = strip_html_tags(card.get("text", "")).strip()[:80]
-                    print(f"    • {card['title']}")
-                    if text_preview:
-                        print(f"      {text_preview}")
-                print("  Re-run with --approve-new [--section SECTION] to add to Confluence.")
-                pending_new_card_ids = [c["_id"] for c in new_cards]
-
-    if args.push_only:
-        print("  Done (push-only mode).")
-        return
-
-    # --- Step 2: Forward sync (Confluence → WFS) ---
-    print("  Parsing tasks...")
-
-    top_level_sections = [
-        "Family Center", "Workplace Deprecation", "AI for Good",
-        "AI", "MDC", "Engineering Services R&D"
-    ]
-
-    def find_section_ranges(html, sections):
-        ranges = []
-        for section in sections:
-            pattern = f'<ac:parameter ac:name="title">{re.escape(section)}</ac:parameter>'
-            match = re.search(pattern, html)
-            if match:
-                ranges.append((match.start(), section))
-        ranges.sort()
-        result = []
-        for i, (pos, name) in enumerate(ranges):
-            end = ranges[i + 1][0] if i + 1 < len(ranges) else len(html)
-            result.append((name, html[pos:end]))
-        return result
-
-    all_tasks = []
-    for section_name, section_html in find_section_ranges(html_content, top_level_sections):
-        task_parser = ConfluenceTaskParser(config["user"]["atlassian_account_id"])
-        task_parser.current_section = section_name
-        task_parser.feed(section_html)
-        for t in task_parser.tasks:
-            t["section"] = section_name
-        all_tasks.extend(task_parser.tasks)
-
-    tasks = all_tasks
-    exclude = config.get("exclude_tasks", [])
-    if exclude:
-        tasks = [t for t in tasks if t["title"] not in exclude]
-    print(f"  Found {len(tasks)} tasks for {config['user']['display_name']}")
-
-    if args.verbose:
-        for t in tasks:
-            role = "ASSIGNED" if t["is_assigned"] else "MENTIONED"
-            print(f"    [{role:8s}] [{t['section']:20s}] {t['title']}")
-
-    print("  Triaging and syncing board...")
-    classified, card_state = sync_board(tasks, config, dry_run=args.dry_run, protected_card_ids=pending_new_card_ids)
-
-    if not args.dry_run and card_state:
-        save_state({
-            "synced_at": datetime.now().isoformat(),
-            "week_date": week_date,
-            "cards": card_state,
-        })
-
-    summary = {}
-    for _, col, _ in classified:
-        summary[col] = summary.get(col, 0) + 1
-    print(f"  Board: {' | '.join(f'{k}={v}' for k, v in summary.items())}")
-    print("  Done.")
+    print("\n  Done.")
 
 
 if __name__ == "__main__":
