@@ -883,55 +883,41 @@ def normalize_match_key(value):
     return value.strip()
 
 
-def task_match_keys(task):
-    keys = []
-    row_local_id = str(task.get("row_local_id") or "").strip()
-    if row_local_id:
-        keys.append(f"row:{row_local_id}")
+def build_card_index(board_docs):
+    """Index live board cards by sourceResourceId and title for matching."""
+    by_source = {}
+    by_title = {}
+
+    for doc in board_docs:
+        src_id = doc.get("sourceResourceId", "").strip()
+        if src_id:
+            by_source[src_id] = doc
+
+        title_key = normalize_match_key(doc.get("title"))
+        if title_key:
+            by_title[title_key] = doc
+
+    return by_source, by_title
+
+
+def find_existing_card(task, by_source, by_title, used_card_ids):
+    """Match a Confluence task to an existing WFS card, preferring sourceResourceId."""
+    row_id = str(task.get("row_local_id") or "").strip()
+    if row_id and row_id in by_source:
+        doc = by_source[row_id]
+        doc_id = doc.get("_id", "")
+        if doc_id not in used_card_ids:
+            used_card_ids.add(doc_id)
+            return doc
 
     for value in (task.get("title_full"), task.get("title")):
         key = normalize_match_key(value)
-        if key:
-            keys.append(f"title:{key}")
-
-    return keys
-
-
-def build_existing_card_index(board_docs, state):
-    index = {}
-    synced_cards = state.get("cards", {})
-
-    for doc in board_docs:
-        doc_id = str(doc.get("_id") or "")
-        saved = synced_cards.get(doc_id, {})
-        keys = []
-
-        row_local_id = str(saved.get("row_local_id") or "").strip()
-        if row_local_id:
-            keys.append(f"row:{row_local_id}")
-
-        for value in (
-            saved.get("confluence_title"),
-            saved.get("title"),
-            doc.get("title"),
-        ):
-            key = normalize_match_key(value)
-            if key:
-                keys.append(f"title:{key}")
-
-        for key in keys:
-            index.setdefault(key, doc)
-
-    return index
-
-
-def find_existing_card(task, existing_index, used_card_ids):
-    for key in task_match_keys(task):
-        doc = existing_index.get(key)
-        doc_id = str(doc.get("_id") or "") if doc else ""
-        if doc and doc_id and doc_id not in used_card_ids:
-            used_card_ids.add(doc_id)
-            return doc
+        if key and key in by_title:
+            doc = by_title[key]
+            doc_id = doc.get("_id", "")
+            if doc_id not in used_card_ids:
+                used_card_ids.add(doc_id)
+                return doc
 
     return None
 
@@ -947,18 +933,27 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
 
     existing = wfs_request(config, f"documents?boardId={board_id}") or []
     board_docs = [d for d in existing if d.get("boardId") == board_id]
-    existing_index = build_existing_card_index(board_docs, state)
+    by_source, by_title = build_card_index(board_docs)
     used_existing_ids = set()
 
-    live_status_by_title = {}
+    live_status = {}
     for card in board_docs:
-        if card.get("title") and card.get("status"):
-            live_status_by_title[card["title"]] = card["status"]
+        src_id = card.get("sourceResourceId", "").strip()
+        title = card.get("title", "")
+        status = card.get("status", "")
+        if status:
+            if src_id:
+                live_status[f"src:{src_id}"] = status
+            if title:
+                live_status[f"title:{title}"] = status
 
     classified = []
     preserved_count = 0
     for task in tasks:
-        saved_col = live_status_by_title.get(task["title"])
+        row_id = str(task.get("row_local_id") or "").strip()
+        saved_col = live_status.get(f"src:{row_id}") if row_id else None
+        if not saved_col:
+            saved_col = live_status.get(f"title:{task['title']}")
         if saved_col and saved_col in all_columns:
             col = saved_col
             preserved_count += 1
@@ -974,7 +969,7 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
 
     matched_cards = {}
     for task, _, _ in classified:
-        doc = find_existing_card(task, existing_index, used_existing_ids)
+        doc = find_existing_card(task, by_source, by_title, used_existing_ids)
         if doc:
             matched_cards[id(task)] = doc
 
@@ -1033,12 +1028,19 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
 
         for task, _, priority in col_tasks:
             card_html = build_card_html(task)
+            row_id = str(task.get("row_local_id") or "").strip()
+            source_fields = {
+                "sourceSystem": "confluence",
+                "sourceResourceId": row_id,
+                "sourceUrl": f"{config['confluence']['base_url']}/wiki/spaces/{config['confluence']['space_key']}",
+            }
             card = {
                 "title": task["title"],
                 "text": card_html,
                 "status": col_key,
                 "type": "document",
                 "boardId": board_id,
+                **source_fields,
             }
             existing_doc = matched_cards.get(id(task))
 
@@ -1053,6 +1055,7 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
                         "title": task["title"],
                         "text": card_html,
                         "type": "document",
+                        **source_fields,
                     })
                 else:
                     result = wfs_request(config, "documents", method="POST", data=card)
