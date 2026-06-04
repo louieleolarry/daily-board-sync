@@ -214,8 +214,8 @@ def extract_new_content(current_text, synced_text):
     Compares plain-text versions for diff detection but returns
     original HTML lines to preserve formatting (bold, links, etc).
     """
-    current_plain = strip_html_tags(current_text).replace('…', '...').strip()
-    synced_plain = strip_html_tags(synced_text).replace('…', '...').strip()
+    current_plain = strip_html_tags(current_text).strip()
+    synced_plain = strip_html_tags(synced_text).strip()
 
     if current_plain == synced_plain:
         return []
@@ -236,8 +236,7 @@ def extract_new_content(current_text, synced_text):
 
     def normalize(line):
         s = re.sub(r'\s+', ' ', line).strip()
-        s = s.replace('…', '...').rstrip('.').rstrip('-').strip()
-        return s
+        return s.rstrip('-').strip()
 
     synced_lines = [l.strip() for l in synced_plain.split("\n") if l.strip()]
     synced_normalized = {normalize(l) for l in synced_lines}
