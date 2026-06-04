@@ -1099,6 +1099,18 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
     return classified, card_state
 
 
+def check_user_events(config, board_id, since_iso):
+    """Check if any user-initiated events occurred on the board since last sync."""
+    since_param = urllib.parse.quote(since_iso)
+    data = wfs_request(config, f"bot/events?boardId={board_id}&since={since_param}&limit=100")
+    if not data or not data.get("ok"):
+        return True, []
+
+    events = data.get("events", [])
+    user_events = [e for e in events if e.get("origin") != "bot-api"]
+    return len(user_events) > 0, user_events
+
+
 TOP_LEVEL_SECTIONS = [
     "Family Center", "Workplace Deprecation", "AI for Good",
     "AI", "MDC", "Engineering Services R&D"
@@ -1135,6 +1147,21 @@ def sync_user(user_key, user_cfg, config, auth, page, html_content, week_date, a
     user_config["user"]["display_name"] = display_name
 
     print(f"\n  === {display_name} ({user_key}) ===")
+
+    # In auto mode, skip if no user-initiated changes since last sync
+    if getattr(args, 'auto', False):
+        sp = state_path_for_user(user_key)
+        if sp.exists():
+            with open(sp) as f:
+                prev_state = json.load(f)
+            last_synced = prev_state.get("synced_at", "")
+            if last_synced:
+                has_changes, events = check_user_events(user_config, board_id, last_synced)
+                if not has_changes:
+                    print(f"  No user changes since {last_synced[:16]} — skipping")
+                    return page, html_content
+                else:
+                    print(f"  {len(events)} user change(s) detected")
 
     sp = state_path_for_user(user_key)
 
@@ -1191,7 +1218,7 @@ def sync_user(user_key, user_cfg, config, auth, page, html_content, week_date, a
     if not args.dry_run and card_state:
         with open(sp, "w") as f:
             json.dump({
-                "synced_at": datetime.now().isoformat(),
+                "synced_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                 "week_date": week_date,
                 "cards": card_state,
             }, f, indent=2)
@@ -1204,18 +1231,36 @@ def sync_user(user_key, user_cfg, config, auth, page, html_content, week_date, a
     return page, html_content
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Bi-directional sync: Confluence ↔ WorkflowShortcuts board")
-    parser.add_argument("--dry-run", action="store_true", help="Preview without writing")
-    parser.add_argument("--date", help="Override week start date (YYYY-MM-DD)")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed output")
-    parser.add_argument("--push-only", action="store_true", help="Only push WFS changes to Confluence")
-    parser.add_argument("--pull-only", action="store_true", help="Only pull Confluence to WFS")
-    parser.add_argument("--approve-new", action="store_true", help="Insert new WFS-only cards into Confluence")
-    parser.add_argument("--section", help="Confluence section for new tasks (e.g. 'AI', 'Family Center')")
-    parser.add_argument("--user", default=None, help="Sync specific user (key from config) or 'all'")
-    args = parser.parse_args()
+def run_daemon(args):
+    """Run sync in a loop every N minutes."""
+    import time as _time
+    interval = args.daemon * 60
+    print(f"Daily Board Sync — daemon mode (every {args.daemon}m)")
+    print(f"  Press Ctrl+C to stop.\n")
 
+    # Force auto mode in daemon
+    args.auto = True
+    args.user = args.user or "all"
+
+    while True:
+        try:
+            run_sync(args)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"\n  ERROR: {e}\n", file=sys.stderr)
+
+        next_run = datetime.now() + timedelta(seconds=interval)
+        print(f"\n  Next sync at {next_run.strftime('%H:%M:%S')} ({args.daemon}m)")
+        try:
+            _time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\n  Daemon stopped.")
+            break
+
+
+def run_sync(args):
+    """Single sync run — extracted from main() for daemon reuse."""
     config = load_config()
     email, token = load_credentials(config)
     auth = (email, token)
@@ -1229,7 +1274,7 @@ def main():
     page = find_weekly_page(config, auth, week_date)
     if not page:
         print("  FAILED: Could not find weekly page", file=sys.stderr)
-        sys.exit(1)
+        return
 
     html_content = page["body"]["storage"]["value"]
     print(f"  Page: {page['title']} (id={page['id']}, v{page['version']['number']})")
@@ -1242,11 +1287,9 @@ def main():
     elif args.user and args.user in users_cfg:
         sync_user(args.user, users_cfg[args.user], config, auth, page, html_content, week_date, args)
     elif users_cfg and not args.user:
-        # Default: sync the first user (bweldy)
         default_key = next(iter(users_cfg))
         sync_user(default_key, users_cfg[default_key], config, auth, page, html_content, week_date, args)
     else:
-        # Legacy fallback: use top-level user config
         user_cfg = {
             "atlassian_account_id": config["user"]["atlassian_account_id"],
             "display_name": config["user"]["display_name"],
@@ -1257,6 +1300,27 @@ def main():
         sync_user("bweldy", user_cfg, config, auth, page, html_content, week_date, args)
 
     print("\n  Done.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Bi-directional sync: Confluence ↔ WorkflowShortcuts board")
+    parser.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    parser.add_argument("--date", help="Override week start date (YYYY-MM-DD)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed output")
+    parser.add_argument("--push-only", action="store_true", help="Only push WFS changes to Confluence")
+    parser.add_argument("--pull-only", action="store_true", help="Only pull Confluence to WFS")
+    parser.add_argument("--approve-new", action="store_true", help="Insert new WFS-only cards into Confluence")
+    parser.add_argument("--section", help="Confluence section for new tasks (e.g. 'AI', 'Family Center')")
+    parser.add_argument("--user", default=None, help="Sync specific user (key from config) or 'all'")
+    parser.add_argument("--auto", action="store_true", help="Skip users with no WFS changes since last sync")
+    parser.add_argument("--daemon", type=int, metavar="MINUTES", help="Run continuously, syncing every N minutes")
+    args = parser.parse_args()
+
+    if args.daemon:
+        run_daemon(args)
+        return
+
+    run_sync(args)
 
 
 if __name__ == "__main__":
