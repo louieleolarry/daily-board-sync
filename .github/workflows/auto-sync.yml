@@ -1,0 +1,58 @@
+name: Auto Sync Boards
+
+on:
+  schedule:
+    # Every 10 minutes, weekdays only (Mon-Fri, 6am-8pm PT / 13:00-03:00 UTC)
+    - cron: '*/10 13-23 * * 1-5'
+    - cron: '*/10 0-3 * * 2-6'
+  workflow_dispatch:
+    inputs:
+      user:
+        description: 'User to sync (key or "all")'
+        default: 'all'
+      dry_run:
+        description: 'Dry run (true/false)'
+        default: 'false'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore sync state
+        uses: actions/cache@v4
+        with:
+          path: last_sync_state*.json
+          key: sync-state-${{ github.run_id }}
+          restore-keys: sync-state-
+
+      - name: Copy config template
+        run: cp config.template.json config.json
+
+      - name: Run sync
+        env:
+          CONFLUENCE_EMAIL: ${{ secrets.CONFLUENCE_EMAIL }}
+          CONFLUENCE_TOKEN: ${{ secrets.CONFLUENCE_TOKEN }}
+          WFS_BOT_TOKEN: ${{ secrets.WFS_BOT_TOKEN }}
+        run: |
+          USER="${{ github.event.inputs.user || 'all' }}"
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          ARGS="--auto --user $USER"
+          if [ "$DRY_RUN" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python3 sync.py $ARGS
+
+      - name: Save sync state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: last_sync_state*.json
+          key: sync-state-${{ github.run_id }}

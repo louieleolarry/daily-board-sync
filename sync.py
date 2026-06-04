@@ -58,6 +58,11 @@ def save_state(state):
 
 
 def load_credentials(config):
+    email = os.environ.get("CONFLUENCE_EMAIL", "")
+    token = os.environ.get("CONFLUENCE_TOKEN", "")
+    if email and token:
+        return email, token
+
     creds = config.get("credentials", {})
     if creds.get("email") and creds.get("token"):
         return creds["email"], creds["token"]
@@ -68,7 +73,7 @@ def load_credentials(config):
             with open(creds_path) as f:
                 jira_config = json.load(f)
             return jira_config["jira"]["email"], jira_config["jira"]["token"]
-    print("  ERROR: No credentials found. Run: python3 sync.py --setup", file=sys.stderr)
+    print("  ERROR: No credentials found.", file=sys.stderr)
     sys.exit(1)
 
 
@@ -96,27 +101,13 @@ def api_request(url, method="GET", data=None, auth=None, extra_headers=None):
 
 
 def get_wfs_token(config):
+    env_token = os.environ.get("WFS_BOT_TOKEN", "").strip()
+    if env_token:
+        return env_token
+
     board_config = config.get("board", {})
     token = str(board_config.get("bot_token") or board_config.get("api_token") or "").strip()
-
-    if token:
-        return token
-
-    env_names = [
-        board_config.get("api_token_env"),
-        "WFS_BOT_TOKEN",
-        "WFS_API_TOKEN",
-        "BOT_API_TOKEN",
-    ]
-
-    for env_name in env_names:
-        if not env_name:
-            continue
-        token = os.environ.get(str(env_name), "").strip()
-        if token:
-            return token
-
-    return ""
+    return token
 
 
 def wfs_request(config, path, method="GET", data=None):
@@ -1012,7 +1003,6 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
 
     if not dry_run:
         wfs_request(config, f"boards/{board_id}", method="PATCH", data={
-            "title": f"BWeldy Daily — {today}",
             "columns": active_columns,
         })
         added_cols = [c["title"] for c in active_columns if c["key"] not in permanent]
