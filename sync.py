@@ -883,19 +883,32 @@ def normalize_match_key(value):
     return value.strip()
 
 
-def build_card_index(board_docs):
-    """Index live board cards by sourceResourceId and title for matching."""
+def build_card_index(board_docs, state=None):
+    """Index live board cards by sourceResourceId and title for matching.
+    Falls back to state file for row_local_id when cards lack sourceResourceId."""
     by_source = {}
     by_title = {}
+    synced_cards = (state or {}).get("cards", {})
 
     for doc in board_docs:
+        doc_id = doc.get("_id", "")
         src_id = doc.get("sourceResourceId", "").strip()
+
+        if not src_id and doc_id in synced_cards:
+            src_id = str(synced_cards[doc_id].get("row_local_id") or "").strip()
+
         if src_id:
             by_source[src_id] = doc
 
         title_key = normalize_match_key(doc.get("title"))
         if title_key:
             by_title[title_key] = doc
+
+        saved = synced_cards.get(doc_id, {})
+        for value in (saved.get("confluence_title"), saved.get("title")):
+            key = normalize_match_key(value)
+            if key and key not in by_title:
+                by_title[key] = doc
 
     return by_source, by_title
 
@@ -933,7 +946,7 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
 
     existing = wfs_request(config, f"documents?boardId={board_id}") or []
     board_docs = [d for d in existing if d.get("boardId") == board_id]
-    by_source, by_title = build_card_index(board_docs)
+    by_source, by_title = build_card_index(board_docs, state)
     used_existing_ids = set()
 
     live_status = {}
