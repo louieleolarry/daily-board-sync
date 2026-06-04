@@ -2,7 +2,9 @@
 
 Bi-directional sync between Codazen's Confluence weekly standup page and personal [WorkflowShortcuts](https://workflowshortcuts.com) kanban boards. Auto-triages tasks, stack-ranks by priority, and syncs edits both ways.
 
-Syncs trigger automatically via Cloudflare Worker webhook relay — no local machine or cron needed.
+Syncs are fully bidirectional and automatic — no local machine needed:
+- **WFS → Confluence:** Instant via Cloudflare Worker webhook relay
+- **Confluence → WFS:** Every 10 minutes via GitHub Actions cron (weekdays, 6am–8pm PT)
 
 ---
 
@@ -83,15 +85,22 @@ Cards are tagged with `sourceSystem: "confluence"` and `sourceResourceId` (the C
 
 Triggered automatically when any user moves a card on their WFS board:
 
+| Direction | Trigger | Latency |
+|---|---|---|
+| WFS → Confluence | Webhook → Cloudflare Worker → GitHub Actions | Instant (~30s) |
+| Confluence → WFS | GitHub Actions cron schedule | Up to 10 min |
+| Manual | GitHub Actions "Run workflow" or local CLI | On demand |
+
 ```
 WFS Board Change → WFS Webhook POST → Cloudflare Worker → GitHub Actions → sync.py
+GitHub Actions Cron (every 10m) → sync.py → Confluence changes → WFS boards updated
 ```
 
 | Component | Location | Purpose |
 |---|---|---|
 | `sync.py` | This repo | Main sync script |
 | Cloudflare Worker | `worker/index.js` | Webhook relay — receives WFS events, triggers GitHub Actions |
-| GitHub Actions | `.github/workflows/auto-sync.yml` | Runs sync on dispatch |
+| GitHub Actions | `.github/workflows/auto-sync.yml` | Runs sync on dispatch + cron |
 | WFS Subscriptions | WFS API | One webhook per board, pointing at the Worker URL |
 
 **Worker URL:** `https://wfs-sync-relay.workflowshortcuts.workers.dev`
@@ -185,17 +194,19 @@ Set in repo **Settings → Secrets and variables → Actions**:
 | `CONFLUENCE_TOKEN` | Atlassian API token |
 | `WFS_BOT_TOKEN` | WorkflowShortcuts bot API key |
 
-### Re-enabling Cron Polling (fallback)
+### Cron Polling (Confluence → WFS)
 
-If the webhook relay goes down, uncomment the `schedule` block in `.github/workflows/auto-sync.yml`:
+The GitHub Actions workflow runs on a 10-minute cron schedule during weekday work hours (6am–8pm PT) to pick up Confluence changes. This complements the webhook relay which handles the WFS → Confluence direction.
+
+Both triggers use `--auto` mode, which checks WFS events and skips boards with no changes — so cron runs are lightweight when nothing has changed.
+
+To adjust the polling interval, edit the `schedule` block in `.github/workflows/auto-sync.yml`:
 
 ```yaml
 schedule:
-  - cron: '*/10 13-23 * * 1-5'
-  - cron: '*/10 0-3 * * 2-6'
+  - cron: '*/10 13-23 * * 1-5'   # UTC 13:00-23:59 Mon-Fri
+  - cron: '*/10 0-3 * * 2-6'     # UTC 00:00-03:00 Tue-Sat (covers PT evening)
 ```
-
-This runs sync every 10 minutes during weekday work hours (6am-8pm PT).
 
 ---
 
