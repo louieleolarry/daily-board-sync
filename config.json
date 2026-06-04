@@ -39,6 +39,27 @@
       "board_id": "6a21c7dfb61e1c042ef80739",
       "board_title_prefix": "SUThaduri Daily",
       "match_name": "sumana"
+    },
+    "jburgess": {
+      "atlassian_account_id": "712020:88f6cbc1-238a-46e3-a30e-8893c445d2e6",
+      "display_name": "Jesse Burgess",
+      "board_id": "6a21cbb5b61e1c042ef80771",
+      "board_title_prefix": "JBurgess Daily",
+      "match_name": "jesse"
+    },
+    "rtighiouart": {
+      "atlassian_account_id": "712020:53d3dc27-d3d5-4623-ad73-221869914292",
+      "display_name": "Rayan Tighiouart",
+      "board_id": "6a21cbb5b61e1c042ef80773",
+      "board_title_prefix": "RTighiouart Daily",
+      "match_name": "rayan"
+    },
+    "mmelchor": {
+      "atlassian_account_id": "5b6bd4c02f51d429dce93f07",
+      "display_name": "Mario Melchor",
+      "board_id": "6a21cbb5b61e1c042ef80775",
+      "board_title_prefix": "MMelchor Daily",
+      "match_name": "mario"
     }
   },
   "exclude_tasks": [
