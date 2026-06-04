@@ -709,6 +709,8 @@ class ConfluenceTaskParser(HTMLParser):
             href = attr_dict.get("href", "")
             self._current_href = href
             self._href_links.append(href)
+            if href:
+                self._current_html += f'<a href="{href}">'
 
         if tag == "time" and self._in_cell:
             dt = attr_dict.get("datetime", "")
@@ -775,6 +777,8 @@ class ConfluenceTaskParser(HTMLParser):
             self._section_stack.pop()
 
         if tag == "a" and self._in_cell:
+            if self._current_href:
+                self._current_html += "</a>"
             self._current_href = None
 
         if tag in ("td", "th") and self._in_row:
