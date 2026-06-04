@@ -673,6 +673,7 @@ class ConfluenceTaskParser(HTMLParser):
         if tag == "p" and self._in_cell:
             if self._current_text and not self._current_text.endswith("\n"):
                 self._current_text += "\n"
+                self._current_html += "<br>"
 
         if tag == "br" and self._in_cell:
             self._current_text += "\n"
@@ -895,7 +896,7 @@ def build_card_html(task):
             if cleaned:
                 parts.append(f"<b>Status:</b> {cleaned.replace(chr(10), '<br>')}")
 
-    return "<div>" + "</div><div>".join(parts) + "</div>"
+    return "<br>".join(parts)
 
 
 def normalize_match_key(value):
