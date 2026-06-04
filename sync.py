@@ -451,6 +451,21 @@ def insert_new_confluence_row(html, section_name, task_title, status_text, user_
     return html[:insert_pos] + new_row + html[insert_pos:]
 
 
+def get_user_edited_card_ids(config, board_id, since_iso):
+    """Return set of card IDs that were edited by a user (not bot) since last sync."""
+    if not since_iso:
+        return None
+    since_param = urllib.parse.quote(since_iso)
+    data = wfs_request(config, f"bot/events?boardId={board_id}&since={since_param}&limit=200")
+    if not data or not data.get("ok"):
+        return None
+    user_card_ids = set()
+    for e in data.get("events", []):
+        if e.get("origin") != "bot-api" and e.get("recordId"):
+            user_card_ids.add(e["recordId"])
+    return user_card_ids
+
+
 def push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=False):
     """Push new content from WFS cards back to the Confluence page."""
     if not state:
@@ -461,6 +476,10 @@ def push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=F
     updates = []
     highlight_updates = []
     column_to_highlight = config["triage"].get("column_to_highlight", {})
+
+    board_id = config["board"]["board_id"]
+    last_synced = state.get("synced_at", "")
+    user_edited_ids = get_user_edited_card_ids(config, board_id, last_synced)
 
     for card in board_cards:
         card_title = card.get("title", "")
@@ -500,6 +519,10 @@ def push_updates_to_confluence(config, auth, page, board_cards, state, dry_run=F
                 })
 
         if card.get("updatedAt") == card.get("createdAt"):
+            continue
+
+        card_id = card.get("_id", "")
+        if user_edited_ids is not None and card_id not in user_edited_ids:
             continue
 
         new_lines = extract_new_content(card_text, saved.get("text", ""))
