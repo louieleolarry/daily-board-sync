@@ -52,9 +52,26 @@ Confluence Standup Page
 
 ### What Each Sync Does
 
-1. **WFS → Confluence:** If you edited a card (added notes, moved columns), changes are pushed back to the matching Confluence row.
+1. **WFS → Confluence:** Only user-typed notes are pushed back. Auto-generated card metadata (Project, Refs, Status headers) is never written to Confluence. Content is deduplicated — lines already in Confluence are skipped.
 
-2. **Confluence → WFS:** Fetches your tasks from the weekly standup, auto-triages into columns, stack-ranks by priority, and updates your board.
+2. **Confluence → WFS:** Fetches your tasks from the weekly standup, auto-triages into columns, stack-ranks by priority, and updates your board. User-added notes on WFS cards are preserved across syncs.
+
+### Formatting Preserved
+
+Rich text formatting survives the round-trip in both directions:
+
+| Format | Supported |
+|---|---|
+| **Bold** | Yes |
+| *Italic* | Yes |
+| Underline | Yes |
+| Unordered lists (bullets) | Yes |
+| Ordered lists (numbered) | Yes |
+| Line breaks | Yes |
+
+### Debounced Webhook Relay
+
+WFS board changes trigger a sync via Cloudflare Worker, but with a **60-second debounce** — the sync waits for 1 full minute of inactivity before firing. This prevents mid-edit triggers while you're still moving cards around.
 
 ### Dynamic Columns
 
