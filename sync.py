@@ -731,9 +731,41 @@ class ConfluenceTaskParser(HTMLParser):
         if tag in ("strong", "b") and self._in_cell:
             self._current_html += "<b>"
 
+        if tag in ("em", "i") and self._in_cell:
+            self._current_html += "<i>"
+
+        if tag in ("u",) and self._in_cell:
+            self._current_html += "<u>"
+
+        if tag == "ul" and self._in_cell:
+            self._current_html += "<ul>"
+
+        if tag == "ol" and self._in_cell:
+            self._current_html += "<ol>"
+
+        if tag == "li" and self._in_cell:
+            self._current_html += "<li>"
+            self._current_text += "• "
+
     def handle_endtag(self, tag):
         if tag in ("strong", "b") and self._in_cell:
             self._current_html += "</b>"
+
+        if tag in ("em", "i") and self._in_cell:
+            self._current_html += "</i>"
+
+        if tag in ("u",) and self._in_cell:
+            self._current_html += "</u>"
+
+        if tag == "li" and self._in_cell:
+            self._current_html += "</li>"
+            self._current_text += "\n"
+
+        if tag == "ul" and self._in_cell:
+            self._current_html += "</ul>"
+
+        if tag == "ol" and self._in_cell:
+            self._current_html += "</ol>"
 
         if tag == "ac:parameter":
             if self._section_stack and self._section_stack[-1] == "__collecting_title__":
