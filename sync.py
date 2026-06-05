@@ -26,6 +26,9 @@ import urllib.parse
 import uuid
 from base64 import b64encode
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+PACIFIC = ZoneInfo("America/Los_Angeles")
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -243,6 +246,31 @@ def normalize_line(line):
     s = strip_html_tags(line)
     s = re.sub(r'\s+', ' ', s).strip()
     return s.rstrip('-').strip()
+
+
+def dedup_card_lines(html):
+    """Collapse exact-duplicate lines in an assembled card body, regardless of
+    which source they came from. Keeps the first occurrence; lines whose
+    normalized text is identical are dropped, while reworded lines are kept.
+    """
+    out = []
+    seen = set()
+    for seg in re.split(r'<br\s*/?>', html):
+        clean = re.sub(r'</?(div|p)[^>]*>', '', seg).strip()
+        if not clean:
+            # preserve a single blank separator, never leading/trailing
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        key = normalize_line(clean)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(clean)
+    while out and out[-1] == "":
+        out.pop()
+    return "<br>".join(out)
 
 
 def extract_new_user_content(card_text, confluence_status_text):
@@ -1142,7 +1170,7 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
         col_tasks.sort(key=lambda x: -x[2])
 
         for task, _, priority in col_tasks:
-            card_html = build_card_html(task)
+            card_html = dedup_card_lines(build_card_html(task))
             row_id = str(task.get("row_local_id") or "").strip()
             source_fields = {
                 "sourceSystem": "confluence",
@@ -1167,10 +1195,14 @@ def sync_board(tasks, config, dry_run=False, protected_card_ids=None):
             else:
                 if existing_doc:
                     existing_text = existing_doc.get("text", "")
-                    user_notes = extract_user_notes(existing_text)
+                    # Use the dedup-aware extractor so we only re-append genuine
+                    # user notes — NOT the Confluence status block already in
+                    # card_html (which caused cards to grow on every sync).
+                    user_notes = extract_new_user_content(existing_text, task.get("status_text", ""))
                     final_html = card_html
                     if user_notes:
                         final_html += "<br><br>" + "<br>".join(user_notes)
+                    final_html = dedup_card_lines(final_html)
                     result = wfs_request(config, f"documents/{existing_doc['_id']}", method="PATCH", data={
                         "title": task["title"],
                         "text": final_html,
@@ -1258,9 +1290,14 @@ def sync_user(user_key, user_cfg, config, auth, page, html_content, week_date, a
             last_synced = prev_state.get("synced_at", "")
             if last_synced:
                 has_changes, events = check_user_events(user_config, board_id, last_synced)
-                if not has_changes:
+                # Only skip if there are no human edits AND we've already synced
+                # today — otherwise a new day must still refresh the board date.
+                already_today = last_synced[:10] == datetime.now(PACIFIC).strftime("%Y-%m-%d")
+                if not has_changes and already_today:
                     print(f"  No user changes since {last_synced[:16]} — skipping")
                     return page, html_content
+                elif not has_changes:
+                    print(f"  No user changes, but stale date ({last_synced[:10]}) — refreshing")
                 else:
                     print(f"  {len(events)} user change(s) detected")
 
@@ -1319,7 +1356,7 @@ def sync_user(user_key, user_cfg, config, auth, page, html_content, week_date, a
     if not args.dry_run and card_state:
         with open(sp, "w") as f:
             json.dump({
-                "synced_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "synced_at": datetime.now(PACIFIC).strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "week_date": week_date,
                 "cards": card_state,
             }, f, indent=2)
